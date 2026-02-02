@@ -28,6 +28,34 @@ import duckdb
 import pandas as pd
 from tqdm import tqdm
 
+# 범용 유틸리티 함수 import
+from utils import (
+    # Database/Table Operations
+    drop_tables,
+    copy_table,
+    copy_tables,
+    show_database_info,
+    show_table_info,
+    rename_column,
+    add_column,
+    get_table_columns,
+    table_exists,
+    get_row_count,
+    # Data I/O
+    load_csv_to_duckdb,
+    export_to_parquet,
+    export_to_csv,
+    # Data Transformation
+    nullify_out_of_range,
+    apply_conditional_transform,
+    add_converted_column,
+    fill_null_values,
+    # Data Analysis
+    analyze_clipping_distribution,
+    analyze_feature_correlation,
+    get_column_stats,
+)
+
 # ============================================================================
 # 로깅 설정
 # ============================================================================
@@ -40,225 +68,11 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# 0. 테이블 삭제 (유틸리티)
+# KKBox 도메인 특화 함수
 # ============================================================================
-def drop_tables(
-    db_path: str,
-    tables: list[str],
-) -> None:
-    """
-    지정된 테이블들을 삭제합니다.
-
-    Args:
-        db_path: DuckDB 데이터베이스 경로
-        tables: 삭제할 테이블 이름 리스트
-    """
-    logger.info(f"=== 테이블 삭제 시작 ===")
-    logger.info(f"삭제 대상: {tables}")
-
-    con = duckdb.connect(db_path)
-
-    existing_tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
-
-    dropped_count = 0
-    for table in tqdm(tables, desc="테이블 삭제"):
-        if table not in existing_tables:
-            logger.warning(f"  {table}: 존재하지 않음, 건너뜀")
-            continue
-
-        row_count = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-        con.execute(f"DROP TABLE {table}")
-        logger.info(f"  {table}: 삭제됨 ({row_count:,} 행)")
-        dropped_count += 1
-
-    # 최종 테이블 목록
-    final_tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
-    logger.info(f"삭제된 테이블 수: {dropped_count}")
-    logger.info(f"남은 테이블 목록: {final_tables}")
-
-    con.close()
-    logger.info(f"=== 테이블 삭제 완료 ===\n")
-
 
 # ============================================================================
-# 0-2. 테이블 복사 (유틸리티)
-# ============================================================================
-def copy_table(
-    db_path: str,
-    source_table: str,
-    target_table: str,
-    force_overwrite: bool = True,
-) -> None:
-    """
-    테이블을 다른 이름으로 복사합니다.
-
-    Args:
-        db_path: DuckDB 데이터베이스 경로
-        source_table: 원본 테이블 이름
-        target_table: 복사할 새 테이블 이름
-        force_overwrite: True면 대상 테이블이 존재할 경우 덮어씀 (기본값: True)
-    """
-    logger.info(f"=== 테이블 복사 시작 ===")
-    logger.info(f"원본: {source_table} -> 대상: {target_table}")
-
-    con = duckdb.connect(db_path)
-
-    existing_tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
-
-    # 원본 테이블 존재 확인
-    if source_table not in existing_tables:
-        logger.error(f"원본 테이블 {source_table}이 존재하지 않습니다.")
-        con.close()
-        return
-
-    # 대상 테이블 존재 확인
-    if target_table in existing_tables:
-        if not force_overwrite:
-            logger.warning(f"대상 테이블 {target_table}이 이미 존재, 건너뜀")
-            con.close()
-            return
-        else:
-            logger.info(f"대상 테이블 {target_table}이 이미 존재, 덮어쓰기")
-
-    # 복사 실행
-    con.execute(f"CREATE OR REPLACE TABLE {target_table} AS SELECT * FROM {source_table}")
-
-    # 결과 로깅
-    row_count = con.execute(f"SELECT COUNT(*) FROM {target_table}").fetchone()[0]
-    col_count = len(con.execute(f"DESCRIBE {target_table}").fetchall())
-    logger.info(f"복사 완료: {row_count:,} 행, {col_count} 열")
-
-    con.close()
-    logger.info(f"=== 테이블 복사 완료 ===\n")
-
-
-# ============================================================================
-# 0-3. 여러 테이블 복사 (유틸리티)
-# ============================================================================
-def copy_tables(
-    db_path: str,
-    table_mapping: dict[str, str],
-    force_overwrite: bool = True,
-) -> None:
-    """
-    여러 테이블을 다른 이름으로 복사합니다.
-
-    Args:
-        db_path: DuckDB 데이터베이스 경로
-        table_mapping: {원본 테이블명: 대상 테이블명} 딕셔너리
-        force_overwrite: True면 대상 테이블이 존재할 경우 덮어씀 (기본값: True)
-    """
-    logger.info(f"=== 여러 테이블 복사 시작 ===")
-    logger.info(f"복사 대상: {table_mapping}")
-
-    con = duckdb.connect(db_path)
-
-    existing_tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
-
-    copied_count = 0
-    for source, target in tqdm(table_mapping.items(), desc="테이블 복사"):
-        # 원본 테이블 존재 확인
-        if source not in existing_tables:
-            logger.warning(f"  {source}: 존재하지 않음, 건너뜀")
-            continue
-
-        # 대상 테이블 존재 확인
-        if target in existing_tables and not force_overwrite:
-            logger.warning(f"  {target}: 이미 존재, 건너뜀")
-            continue
-
-        # 복사 실행
-        con.execute(f"CREATE OR REPLACE TABLE {target} AS SELECT * FROM {source}")
-        row_count = con.execute(f"SELECT COUNT(*) FROM {target}").fetchone()[0]
-        logger.info(f"  {source} -> {target}: {row_count:,} 행")
-        copied_count += 1
-
-    logger.info(f"복사된 테이블 수: {copied_count}")
-
-    con.close()
-    logger.info(f"=== 여러 테이블 복사 완료 ===\n")
-
-
-# ============================================================================
-# 1. CSV를 DuckDB 테이블로 로드
-# ============================================================================
-def load_csv_to_duckdb(
-    db_path: str,
-    csv_dir: str,
-    csv_files: list[str],
-    chunksize: int = 100_000,
-    force_overwrite: bool = True,
-) -> None:
-    """
-    지정된 CSV 파일들을 DuckDB 테이블로 로드합니다.
-
-    Args:
-        db_path: DuckDB 데이터베이스 경로
-        csv_dir: CSV 파일들이 있는 디렉토리 경로
-        csv_files: 로드할 CSV 파일명 리스트 (확장자 포함)
-        chunksize: 한 번에 읽을 행 수
-        force_overwrite: True면 이미 존재하는 테이블을 덮어씀 (기본값: True)
-    """
-    logger.info(f"=== CSV -> DuckDB 로드 시작 ===")
-    logger.info(f"데이터베이스: {db_path}")
-    logger.info(f"CSV 디렉토리: {csv_dir}")
-    logger.info(f"대상 CSV 파일: {csv_files}")
-
-    con = duckdb.connect(db_path)
-
-    for csv_file in tqdm(csv_files, desc="CSV 파일 로드"):
-        table_name = csv_file.replace(".csv", "")
-        csv_path = os.path.join(csv_dir, csv_file)
-
-        if not os.path.exists(csv_path):
-            logger.warning(f"  {csv_file}: 파일이 존재하지 않음, 건너뜀")
-            continue
-
-        # 테이블 존재 여부 확인
-        table_exists = False
-        try:
-            result = con.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()
-            if result is not None:
-                table_exists = True
-                if not force_overwrite:
-                    logger.info(f"  {table_name}: 이미 존재 (행 수: {result[0]:,}), 건너뜀")
-                    continue
-                else:
-                    logger.info(f"  {table_name}: 이미 존재 (행 수: {result[0]:,}), 덮어쓰기")
-                    con.execute(f"DROP TABLE {table_name}")
-        except Exception:
-            pass
-
-        logger.info(f"  {csv_file} -> {table_name} 로드 중...")
-
-        # 청크 단위로 로드 (진행률을 같은 줄에서 덮어쓰기)
-        total_rows = 0
-        chunk_count = 0
-        for i, chunk in enumerate(pd.read_csv(csv_path, chunksize=chunksize)):
-            if i == 0:
-                con.execute(f"CREATE TABLE IF NOT EXISTS {table_name} AS SELECT * FROM chunk")
-            else:
-                con.execute(f"INSERT INTO {table_name} SELECT * FROM chunk")
-            total_rows += len(chunk)
-            chunk_count = i + 1
-            # 같은 줄에서 덮어쓰기 (carriage return 사용)
-            sys.stdout.write(f"\r    청크 {chunk_count:,} 완료 | 누적 행: {total_rows:,}")
-            sys.stdout.flush()
-
-        # 줄바꿈으로 청크 로딩 완료 표시
-        sys.stdout.write("\n")
-        sys.stdout.flush()
-
-        # 결과 로깅
-        col_count = len(con.execute(f"DESCRIBE {table_name}").fetchall())
-        logger.info(f"    완료: {total_rows:,} 행, {col_count} 열 (총 {chunk_count:,} 청크)")
-
-    con.close()
-    logger.info(f"=== CSV -> DuckDB 로드 완료 ===\n")
-
-
-# ============================================================================
-# 2. 테이블 이름 정규화 (_v1 appendix 추가)
+# 1. 테이블 이름 정규화 (_v1 appendix 추가)
 # ============================================================================
 def rename_tables_add_v1_suffix(
     db_path: str,
@@ -1323,360 +1137,6 @@ def analyze_duplicate_transactions(
 
 
 # ============================================================================
-# 5-7. Feature Correlation 분석 및 히트맵 저장
-# ============================================================================
-def analyze_feature_correlation(
-    db_path: str,
-    table_name: str,
-    output_dir: str,
-    exclude_cols: list[str] = None,
-    sample_size: int = None,
-    corr_threshold: float = 0.5,
-    null_handling: str = "dropna",
-    null_values: dict = None,
-) -> None:
-    """
-    테이블의 수치형 컬럼 간 상관관계를 분석하고 히트맵을 저장합니다.
-
-    Args:
-        db_path: DuckDB 데이터베이스 경로
-        table_name: 분석할 테이블 이름
-        output_dir: 히트맵 이미지 저장 디렉토리
-        exclude_cols: 분석에서 제외할 컬럼 리스트 (기본값: user_id, msno, date 관련)
-        sample_size: 샘플 크기 (None이면 전체 데이터, 대용량 테이블에서는 샘플링 권장)
-        corr_threshold: 로그에 출력할 상관관계 임계값 (기본값: 0.5)
-        null_handling: NULL 값 처리 방법 (기본값: "dropna")
-            - "dropna": NULL이 있는 행 제외
-            - "fillzero": NULL을 0으로 채움
-            - "fillmean": NULL을 해당 컬럼 평균으로 채움
-        null_values: 특정 값을 NULL로 처리할 규칙 딕셔너리 (기본값: None)
-            - 특정 값 리스트: {"gender": [-1], "bd": [0]}
-            - 범위 지정: {"total_secs": {"min": 0, "max": 86400}}  # 범위 밖 값을 NULL로
-            - 혼합 사용 가능: {"gender": [-1], "total_secs": {"min": 0, "max": 86400}}
-    """
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-    import numpy as np
-
-    logger.info(f"=== Feature Correlation 분석 시작 ===")
-    logger.info(f"대상 테이블: {table_name}")
-
-    con = duckdb.connect(db_path, read_only=True)
-
-    existing_tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
-
-    if table_name not in existing_tables:
-        logger.error(f"{table_name} 테이블이 존재하지 않습니다.")
-        con.close()
-        return
-
-    # 컬럼 정보 조회
-    cols_info = con.execute(f"DESCRIBE {table_name}").fetchall()
-    all_cols = {row[0]: row[1] for row in cols_info}
-
-    logger.info(f"전체 컬럼 수: {len(all_cols)}")
-
-    # 기본 제외 컬럼
-    if exclude_cols is None:
-        exclude_cols = ["user_id", "msno", "date", "date_idx", "transaction_date",
-                        "membership_expire_date", "registration_init_time", "expiration_date"]
-
-    # 수치형 컬럼만 선택 (INTEGER, BIGINT, DOUBLE, FLOAT, DECIMAL 등)
-    numeric_types = ["INTEGER", "BIGINT", "DOUBLE", "FLOAT", "DECIMAL", "REAL", "SMALLINT", "TINYINT"]
-    numeric_cols = []
-    for col_name, col_type in all_cols.items():
-        if col_name.lower() in [c.lower() for c in exclude_cols]:
-            continue
-        if any(nt in col_type.upper() for nt in numeric_types):
-            numeric_cols.append(col_name)
-
-    logger.info(f"수치형 컬럼 수: {len(numeric_cols)}")
-    logger.info(f"분석 대상 컬럼: {numeric_cols}")
-
-    if len(numeric_cols) < 2:
-        logger.warning("상관관계 분석에 필요한 수치형 컬럼이 2개 미만입니다.")
-        con.close()
-        return
-
-    # 데이터 로드 (샘플링 옵션)
-    cols_str = ", ".join(numeric_cols)
-    if sample_size:
-        total_rows = con.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
-        logger.info(f"전체 행 수: {total_rows:,}, 샘플 크기: {sample_size:,}")
-        query = f"SELECT {cols_str} FROM {table_name} USING SAMPLE {sample_size}"
-    else:
-        query = f"SELECT {cols_str} FROM {table_name}"
-
-    logger.info("데이터 로드 중...")
-    df = con.execute(query).fetchdf()
-    logger.info(f"로드된 행 수: {len(df):,}")
-
-    # 특정 값을 NULL로 변환
-    if null_values:
-        logger.info("특정 값 -> NULL 변환 중...")
-        for col, rule in null_values.items():
-            if col not in df.columns:
-                logger.warning(f"  {col}: 컬럼이 존재하지 않음, 건너뜀")
-                continue
-
-            if isinstance(rule, list):
-                # 특정 값 리스트를 NULL로 변환
-                mask = df[col].isin(rule)
-                count = mask.sum()
-                df.loc[mask, col] = None
-                logger.info(f"  {col}: 값 {rule} -> NULL ({count:,}개 변환)")
-            elif isinstance(rule, dict):
-                # 범위 기반 변환 (범위 밖 값을 NULL로)
-                min_val = rule.get("min")
-                max_val = rule.get("max")
-                mask = False
-                if min_val is not None:
-                    mask = mask | (df[col] < min_val)
-                if max_val is not None:
-                    mask = mask | (df[col] > max_val)
-                count = mask.sum()
-                df.loc[mask, col] = None
-                range_str = f"[{min_val}, {max_val}]"
-                logger.info(f"  {col}: 범위 {range_str} 밖 -> NULL ({count:,}개 변환)")
-
-    # NULL 값 처리
-    null_counts = df.isnull().sum()
-    total_nulls = null_counts.sum()
-
-    if total_nulls == 0:
-        logger.info("NULL 값 없음")
-    else:
-        logger.info(f"NULL 값 발견: 총 {total_nulls:,}개")
-        for col in null_counts[null_counts > 0].index:
-            logger.info(f"  {col}: {null_counts[col]:,}개 NULL")
-
-        rows_before = len(df)
-        if null_handling == "dropna":
-            df = df.dropna()
-            logger.info(f"NULL 처리 (dropna): {rows_before:,} -> {len(df):,} 행 ({rows_before - len(df):,} 제거)")
-        elif null_handling == "fillzero":
-            df = df.fillna(0)
-            logger.info(f"NULL 처리 (fillzero): NULL을 0으로 대체")
-        elif null_handling == "fillmean":
-            df = df.fillna(df.mean())
-            logger.info(f"NULL 처리 (fillmean): NULL을 컬럼 평균으로 대체")
-        else:
-            logger.warning(f"알 수 없는 null_handling 옵션: {null_handling}, dropna로 처리")
-            df = df.dropna()
-            logger.info(f"NULL 처리 (dropna): {rows_before:,} -> {len(df):,} 행 ({rows_before - len(df):,} 제거)")
-
-        if len(df) == 0:
-            logger.error("NULL 처리 후 데이터가 없습니다.")
-            con.close()
-            return
-
-    # 상관관계 계산
-    logger.info("상관관계 계산 중...")
-    corr_matrix = df.corr()
-
-    # 상관관계가 높은 쌍 찾기 (대각선 제외)
-    logger.info(f"\n상관관계 |r| >= {corr_threshold} 인 쌍:")
-    high_corr_pairs = []
-    for i in range(len(corr_matrix.columns)):
-        for j in range(i + 1, len(corr_matrix.columns)):
-            col1 = corr_matrix.columns[i]
-            col2 = corr_matrix.columns[j]
-            corr_val = corr_matrix.iloc[i, j]
-            if abs(corr_val) >= corr_threshold:
-                high_corr_pairs.append((col1, col2, corr_val))
-
-    # 상관관계 절대값 기준 정렬
-    high_corr_pairs.sort(key=lambda x: abs(x[2]), reverse=True)
-
-    if high_corr_pairs:
-        for col1, col2, corr_val in high_corr_pairs:
-            logger.info(f"  {col1} <-> {col2}: {corr_val:.4f}")
-    else:
-        logger.info(f"  (없음)")
-
-    # 상관관계 요약 통계
-    upper_tri = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-    corr_values = upper_tri.stack().values
-
-    logger.info(f"\n상관관계 요약 통계:")
-    logger.info(f"  평균: {np.mean(corr_values):.4f}")
-    logger.info(f"  표준편차: {np.std(corr_values):.4f}")
-    logger.info(f"  최소: {np.min(corr_values):.4f}")
-    logger.info(f"  최대: {np.max(corr_values):.4f}")
-
-    # 히트맵 생성 (전체 대칭 행렬 표시)
-    fig_size = max(10, len(numeric_cols) * 0.6)
-    fig, ax = plt.subplots(figsize=(fig_size, fig_size))
-
-    sns.heatmap(
-        corr_matrix,
-        annot=True if len(numeric_cols) <= 15 else False,
-        fmt='.2f' if len(numeric_cols) <= 15 else '',
-        cmap='RdBu_r',
-        center=0,
-        vmin=-1,
-        vmax=1,
-        square=True,
-        linewidths=0.5,
-        cbar_kws={'label': 'Correlation', 'shrink': 0.8},
-        ax=ax
-    )
-
-    ax.set_title(f'Feature Correlation Matrix: {table_name}\n({len(df):,} rows, {len(numeric_cols)} features)',
-                 fontsize=14, fontweight='bold', pad=20)
-
-    plt.xticks(rotation=45, ha='right')
-    plt.yticks(rotation=0)
-    plt.tight_layout()
-
-    # 저장
-    os.makedirs(output_dir, exist_ok=True)
-    output_file = os.path.join(output_dir, f"correlation_{table_name}.png")
-    plt.savefig(output_file, dpi=150, bbox_inches='tight')
-    plt.close()
-
-    logger.info(f"\n히트맵 저장: {output_file}")
-
-    # 상관관계 행렬 CSV 저장
-    csv_file = os.path.join(output_dir, f"correlation_{table_name}.csv")
-    corr_matrix.to_csv(csv_file)
-    logger.info(f"상관관계 행렬 CSV 저장: {csv_file}")
-
-    con.close()
-    logger.info(f"=== Feature Correlation 분석 완료 ===\n")
-
-
-# ============================================================================
-# 5-8. 컬럼 값 범위 정제 (범위 외 값을 NULL로 변환)
-# ============================================================================
-def nullify_out_of_range(
-    db_path: str,
-    table_name: str,
-    column_name: str,
-    min_val: float = None,
-    max_val: float = None,
-) -> None:
-    """
-    테이블의 특정 컬럼에서 지정된 범위를 벗어나는 값을 NULL로 변환합니다.
-
-    Args:
-        db_path: DuckDB 데이터베이스 경로
-        table_name: 대상 테이블 이름
-        column_name: 대상 컬럼 이름
-        min_val: 최소값 (이 값 미만은 NULL로 변환, None이면 하한 없음)
-        max_val: 최대값 (이 값 초과는 NULL로 변환, None이면 상한 없음)
-    """
-    logger.info(f"=== 범위 외 값 NULL 변환 시작 ===")
-    logger.info(f"테이블: {table_name}, 컬럼: {column_name}")
-    logger.info(f"유효 범위: [{min_val}, {max_val}]")
-
-    con = duckdb.connect(db_path)
-    con.execute("PRAGMA threads=8;")
-
-    # 테이블 존재 확인
-    existing_tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
-    if table_name not in existing_tables:
-        logger.error(f"{table_name} 테이블이 존재하지 않습니다.")
-        con.close()
-        return
-
-    # 컬럼 존재 확인
-    cols = [row[0] for row in con.execute(f"DESCRIBE {table_name}").fetchall()]
-    if column_name not in cols:
-        logger.error(f"{column_name} 컬럼이 존재하지 않습니다.")
-        con.close()
-        return
-
-    # 변환 전 통계
-    stats_before = con.execute(f"""
-        SELECT
-            COUNT(*) as total,
-            COUNT({column_name}) as non_null,
-            SUM(CASE WHEN {column_name} IS NULL THEN 1 ELSE 0 END) as null_cnt,
-            MIN({column_name}) as min_val,
-            MAX({column_name}) as max_val,
-            AVG({column_name}) as avg_val
-        FROM {table_name}
-    """).fetchdf()
-    logger.info(f"변환 전 통계:")
-    logger.info(f"  전체 행: {stats_before['total'].iloc[0]:,}")
-    logger.info(f"  NULL 수: {stats_before['null_cnt'].iloc[0]:,}")
-    logger.info(f"  최소값: {stats_before['min_val'].iloc[0]}")
-    logger.info(f"  최대값: {stats_before['max_val'].iloc[0]}")
-    logger.info(f"  평균: {stats_before['avg_val'].iloc[0]:.4f}")
-
-    # 범위 외 값 개수 확인
-    conditions = []
-    if min_val is not None:
-        conditions.append(f"{column_name} < {min_val}")
-    if max_val is not None:
-        conditions.append(f"{column_name} > {max_val}")
-
-    if not conditions:
-        logger.warning("min_val과 max_val이 모두 None입니다. 변환할 내용이 없습니다.")
-        con.close()
-        return
-
-    condition_str = " OR ".join(conditions)
-    out_of_range_count = con.execute(f"""
-        SELECT COUNT(*) FROM {table_name}
-        WHERE {condition_str}
-    """).fetchone()[0]
-
-    logger.info(f"범위 외 값 개수: {out_of_range_count:,}")
-
-    if out_of_range_count == 0:
-        logger.info("범위 외 값이 없습니다. 변환을 건너뜁니다.")
-        con.close()
-        logger.info(f"=== 범위 외 값 NULL 변환 완료 ===\n")
-        return
-
-    # CASE 문으로 범위 외 값을 NULL로 변환
-    case_conditions = []
-    if min_val is not None:
-        case_conditions.append(f"WHEN {column_name} < {min_val} THEN NULL")
-    if max_val is not None:
-        case_conditions.append(f"WHEN {column_name} > {max_val} THEN NULL")
-    case_str = " ".join(case_conditions)
-
-    # 임시 테이블로 변환 후 교체
-    con.execute(f"""
-        CREATE OR REPLACE TABLE {table_name}_temp AS
-        SELECT
-            * EXCLUDE ({column_name}),
-            CASE
-                {case_str}
-                ELSE {column_name}
-            END AS {column_name}
-        FROM {table_name};
-    """)
-
-    con.execute(f"DROP TABLE {table_name};")
-    con.execute(f"ALTER TABLE {table_name}_temp RENAME TO {table_name};")
-
-    # 변환 후 통계
-    stats_after = con.execute(f"""
-        SELECT
-            COUNT(*) as total,
-            COUNT({column_name}) as non_null,
-            SUM(CASE WHEN {column_name} IS NULL THEN 1 ELSE 0 END) as null_cnt,
-            MIN({column_name}) as min_val,
-            MAX({column_name}) as max_val,
-            AVG({column_name}) as avg_val
-        FROM {table_name}
-    """).fetchdf()
-    logger.info(f"변환 후 통계:")
-    logger.info(f"  전체 행: {stats_after['total'].iloc[0]:,}")
-    logger.info(f"  NULL 수: {stats_after['null_cnt'].iloc[0]:,} (+{out_of_range_count:,})")
-    logger.info(f"  최소값: {stats_after['min_val'].iloc[0]}")
-    logger.info(f"  최대값: {stats_after['max_val'].iloc[0]}")
-    logger.info(f"  평균: {stats_after['avg_val'].iloc[0]:.4f}")
-
-    con.close()
-    logger.info(f"=== 범위 외 값 NULL 변환 완료 ===\n")
-
-
-# ============================================================================
 # 6. gender 필드 정수 변환 (null->-1, male->0, female->1)
 # ============================================================================
 def convert_gender_to_int(
@@ -1893,86 +1353,501 @@ def rename_msno_to_user_id(
 
 
 # ============================================================================
-# 9. Parquet 내보내기
+# 8.5. 트랜잭션 시퀀스 테이블 생성
 # ============================================================================
-def export_to_parquet(
+def create_transactions_seq(
     db_path: str,
-    output_dir: str,
-    tables: list[str],
-    compression: str = "zstd",
+    source_table: str = "transactions_merge",
+    target_table: str = "transactions_seq",
+    gap_days: int = 30,
+    cutoff_date: str = "2017-03-31",
 ) -> None:
     """
-    지정된 테이블들을 Parquet 포맷으로 내보냅니다.
+    트랜잭션 시퀀스 테이블을 생성합니다.
+
+    각 유저의 트랜잭션을 시간순으로 정렬하고, 이전 membership_expire_date로부터
+    gap_days일 이내에 발생한 연속 트랜잭션을 동일 시퀀스 그룹으로 연결합니다.
 
     Args:
         db_path: DuckDB 데이터베이스 경로
-        output_dir: Parquet 파일 출력 디렉토리
-        tables: 내보낼 테이블 이름 리스트
-        compression: 압축 방식 (기본값: zstd)
-    """
-    logger.info(f"=== Parquet 내보내기 시작 ===")
-    logger.info(f"출력 디렉토리: {output_dir}")
-    logger.info(f"대상 테이블: {tables}")
-    logger.info(f"압축: {compression}")
+        source_table: 원본 트랜잭션 테이블명 (기본값: transactions_merge)
+        target_table: 생성할 시퀀스 테이블명 (기본값: transactions_seq)
+        gap_days: 시퀀스 연결 기준 일수 (기본값: 30)
+        cutoff_date: 데이터 범위 마지막 날짜 (기본값: 2017-03-31)
 
-    os.makedirs(output_dir, exist_ok=True)
+    생성되는 컬럼:
+        - sequence_group_id: 유저 내 시퀀스 그룹 ID (0, 1, ...)
+        - sequence_id: 그룹 내 순서 (0, 1, ...)
+        - before_transaction_term: 이전 트랜잭션으로부터의 일수
+        - before_membership_expire_term: 이전 membership_expire_date로부터의 일수
+        - is_churn: 이탈 여부 (0: 유지, 1: 이탈, -1: 판단 불가)
+    """
+    logger.info(f"=== 트랜잭션 시퀀스 테이블 생성 시작 ===")
+    logger.info(f"원본 테이블: {source_table}")
+    logger.info(f"대상 테이블: {target_table}")
+    logger.info(f"시퀀스 연결 기준: {gap_days}일")
+    logger.info(f"데이터 cutoff: {cutoff_date}")
 
     con = duckdb.connect(db_path)
     con.execute("PRAGMA threads=8;")
 
+    # 원본 테이블 존재 확인
     existing_tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
+    if source_table not in existing_tables:
+        logger.error(f"원본 테이블 {source_table}이 존재하지 않습니다.")
+        con.close()
+        return
 
-    for table in tqdm(tables, desc="Parquet 내보내기"):
-        if table not in existing_tables:
-            logger.warning(f"  {table}: 존재하지 않음, 건너뜀")
-            continue
+    # 원본 테이블 정보
+    source_count = con.execute(f"SELECT COUNT(*) FROM {source_table}").fetchone()[0]
+    logger.info(f"원본 테이블 행 수: {source_count:,}")
 
-        output_file = os.path.join(output_dir, f"{table}.parquet")
+    # SQL 기반으로 시퀀스 테이블 생성 (Window 함수 활용)
+    logger.info(f"SQL 기반 시퀀스 계산 중...")
 
-        # 테이블 정보
-        row_count = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-        cols_info = con.execute(f"DESCRIBE {table}").fetchall()
-        col_count = len(cols_info)
+    con.execute(f"""
+        CREATE OR REPLACE TABLE {target_table} AS
+        WITH ordered_txn AS (
+            -- Step 1: 정렬 및 이전 행 정보 가져오기
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY user_id
+                    ORDER BY transaction_date, membership_expire_date
+                ) AS row_num,
+                LAG(transaction_date) OVER (
+                    PARTITION BY user_id
+                    ORDER BY transaction_date, membership_expire_date
+                ) AS prev_txn_date,
+                LAG(membership_expire_date) OVER (
+                    PARTITION BY user_id
+                    ORDER BY transaction_date, membership_expire_date
+                ) AS prev_expire_date
+            FROM {source_table}
+        ),
+        with_gap AS (
+            -- Step 2: 이전 expire_date로부터의 일수 계산 및 시퀀스 끊김 여부 판단
+            SELECT
+                *,
+                CASE
+                    WHEN row_num = 1 THEN 1  -- 유저의 첫 트랜잭션은 새 그룹 시작
+                    WHEN transaction_date - prev_expire_date > {gap_days} THEN 1  -- gap 초과시 새 그룹
+                    ELSE 0
+                END AS is_new_group
+            FROM ordered_txn
+        ),
+        with_group AS (
+            -- Step 3: 시퀀스 그룹 ID 계산 (cumsum of is_new_group - 1)
+            SELECT
+                *,
+                SUM(is_new_group) OVER (
+                    PARTITION BY user_id
+                    ORDER BY transaction_date, membership_expire_date
+                    ROWS UNBOUNDED PRECEDING
+                ) - 1 AS sequence_group_id
+            FROM with_gap
+        ),
+        with_seq_id AS (
+            -- Step 4: 그룹 내 시퀀스 ID 계산
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY user_id, sequence_group_id
+                    ORDER BY transaction_date, membership_expire_date
+                ) - 1 AS sequence_id
+            FROM with_group
+        ),
+        with_terms AS (
+            -- Step 5: before_transaction_term, before_membership_expire_term 계산
+            -- 시퀀스 그룹 내 첫번째가 아니면: 바로 직전 트랜잭션으로부터 계산
+            -- 시퀀스 그룹 내 첫번째이고 이전 시퀀스가 있으면: 이전 시퀀스 마지막으로부터 계산
+            -- 시퀀스 그룹 내 첫번째이고 이전 시퀀스가 없으면: -1
+            SELECT
+                *,
+                CASE
+                    WHEN sequence_id > 0 THEN transaction_date - prev_txn_date
+                    WHEN sequence_group_id > 0 THEN transaction_date - prev_txn_date
+                    ELSE -1
+                END AS before_transaction_term,
+                CASE
+                    WHEN sequence_id > 0 THEN transaction_date - prev_expire_date
+                    WHEN sequence_group_id > 0 THEN transaction_date - prev_expire_date
+                    ELSE -1
+                END AS before_membership_expire_term
+            FROM with_seq_id
+        ),
+        with_group_info AS (
+            -- Step 6: 각 그룹의 마지막 트랜잭션 여부 및 다음 그룹 존재 여부 확인
+            SELECT
+                *,
+                MAX(sequence_id) OVER (
+                    PARTITION BY user_id, sequence_group_id
+                ) AS max_seq_in_group,
+                MAX(sequence_group_id) OVER (
+                    PARTITION BY user_id
+                ) AS max_group_for_user,
+                LEAD(transaction_date) OVER (
+                    PARTITION BY user_id
+                    ORDER BY transaction_date, membership_expire_date
+                ) AS next_txn_date
+            FROM with_terms
+        ),
+        final AS (
+            -- Step 7: is_churn 계산
+            -- 그룹의 마지막이 아니면: 0
+            -- 그룹의 마지막이고:
+            --   - 다음 그룹이 있으면 (next_txn가 있고 gap 초과):
+            --       expire + 30 > cutoff면 -1, 아니면 1
+            --   - 유저의 마지막 트랜잭션이면:
+            --       expire + 30 > cutoff면 -1, 아니면 1
+            SELECT
+                user_id,
+                payment_method_id,
+                payment_plan_days,
+                plan_list_price,
+                actual_amount_paid,
+                is_auto_renew,
+                transaction_date,
+                membership_expire_date,
+                is_cancel,
+                CAST(sequence_group_id AS BIGINT) AS sequence_group_id,
+                CAST(sequence_id AS BIGINT) AS sequence_id,
+                CAST(before_transaction_term AS BIGINT) AS before_transaction_term,
+                CAST(before_membership_expire_term AS BIGINT) AS before_membership_expire_term,
+                CAST(
+                    CASE
+                        WHEN sequence_id < max_seq_in_group THEN 0  -- 그룹 중간
+                        -- 그룹의 마지막 트랜잭션
+                        WHEN membership_expire_date + INTERVAL '{gap_days} days' > DATE '{cutoff_date}' THEN -1
+                        ELSE 1
+                    END AS BIGINT
+                ) AS is_churn
+            FROM with_group_info
+        )
+        SELECT * FROM final
+        ORDER BY user_id, transaction_date, membership_expire_date;
+    """)
 
-        logger.info(f"  {table}: {row_count:,} 행, {col_count} 열")
+    # 결과 통계
+    result_count = con.execute(f"SELECT COUNT(*) FROM {target_table}").fetchone()[0]
+    unique_users = con.execute(f"SELECT COUNT(DISTINCT user_id) FROM {target_table}").fetchone()[0]
 
-        # 컬럼별 정보
-        logger.info(f"    컬럼: {[col[0] for col in cols_info]}")
+    # is_churn 분포
+    churn_stats = con.execute(f"""
+        SELECT is_churn, COUNT(*) as cnt
+        FROM {target_table}
+        GROUP BY is_churn
+        ORDER BY is_churn
+    """).fetchall()
 
-        # 내보내기
-        con.execute(f"""
-            COPY {table}
-            TO '{output_file}'
-            (FORMAT parquet, COMPRESSION {compression});
-        """)
+    logger.info(f"생성 완료: {result_count:,} 행, {unique_users:,} 유저")
+    logger.info(f"is_churn 분포:")
+    for churn_val, cnt in churn_stats:
+        logger.info(f"  {churn_val}: {cnt:,}")
 
-        # 파일 크기 확인
-        file_size = os.path.getsize(output_file) / (1024 * 1024)  # MB
-        logger.info(f"    -> {output_file} ({file_size:.2f} MB)")
+    # 샘플 데이터 출력
+    sample = con.execute(f"""
+        SELECT user_id, transaction_date, membership_expire_date,
+               sequence_group_id, sequence_id,
+               before_transaction_term, before_membership_expire_term, is_churn
+        FROM {target_table}
+        WHERE user_id = (
+            SELECT user_id FROM {target_table}
+            GROUP BY user_id
+            HAVING COUNT(DISTINCT sequence_group_id) >= 2
+            LIMIT 1
+        )
+        ORDER BY transaction_date
+        LIMIT 15
+    """).fetchdf()
+    logger.info(f"샘플 데이터 (시퀀스 그룹 2개 이상 유저):\n{sample.to_string()}")
 
     con.close()
-    logger.info(f"=== Parquet 내보내기 완료 ===\n")
+    logger.info(f"=== 트랜잭션 시퀀스 테이블 생성 완료 ===\n")
 
 
 # ============================================================================
-# 유틸리티 함수
+# 8.6. members_merge에 멤버십 시퀀스 정보 추가
 # ============================================================================
-def show_database_info(db_path: str) -> None:
-    """데이터베이스의 전체 정보를 출력합니다."""
-    logger.info(f"=== 데이터베이스 정보 ===")
+def add_membership_seq_info(
+    db_path: str,
+    members_table: str = "members_merge",
+    seq_table: str = "transactions_seq",
+) -> None:
+    """
+    members_merge 테이블에 멤버십 시퀀스 정보를 추가합니다.
+
+    각 유저의 last_expire에 해당하는 트랜잭션의 시퀀스 정보를 저장합니다.
+    만약 last_expire이 cancel로 인한 expire 갱신일 경우,
+    is_cancel이 아닌 가장 최근의 멤버십을 직전 멤버십으로 간주합니다.
+
+    Args:
+        db_path: DuckDB 데이터베이스 경로
+        members_table: 멤버 테이블명 (기본값: members_merge)
+        seq_table: 시퀀스 테이블명 (기본값: transactions_seq)
+
+    추가되는 컬럼:
+        - membership_seq_group_id: last_expire 트랜잭션의 sequence_group_id
+        - membership_seq_id: 해당 시퀀스의 sequence_id
+    """
+    logger.info(f"=== 멤버십 시퀀스 정보 추가 시작 ===")
+    logger.info(f"대상 테이블: {members_table}")
+    logger.info(f"시퀀스 테이블: {seq_table}")
 
     con = duckdb.connect(db_path)
+    con.execute("PRAGMA threads=8;")
 
-    tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
-    logger.info(f"테이블 수: {len(tables)}")
+    # 테이블 존재 확인
+    existing_tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
+    if members_table not in existing_tables:
+        logger.error(f"테이블 {members_table}이 존재하지 않습니다.")
+        con.close()
+        return
+    if seq_table not in existing_tables:
+        logger.error(f"테이블 {seq_table}이 존재하지 않습니다.")
+        con.close()
+        return
 
-    for table in tables:
-        row_count = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-        cols = con.execute(f"DESCRIBE {table}").fetchall()
-        logger.info(f"  {table}: {row_count:,} 행, {len(cols)} 열")
+    # 기존 컬럼 삭제 (있으면)
+    cols = [row[0] for row in con.execute(f"DESCRIBE {members_table}").fetchall()]
+    if "membership_seq_group_id" in cols:
+        con.execute(f"ALTER TABLE {members_table} DROP COLUMN membership_seq_group_id")
+        logger.info("기존 membership_seq_group_id 컬럼 삭제")
+    if "membership_seq_id" in cols:
+        con.execute(f"ALTER TABLE {members_table} DROP COLUMN membership_seq_id")
+        logger.info("기존 membership_seq_id 컬럼 삭제")
+
+    # 새 컬럼 추가
+    con.execute(f"ALTER TABLE {members_table} ADD COLUMN membership_seq_group_id BIGINT")
+    con.execute(f"ALTER TABLE {members_table} ADD COLUMN membership_seq_id BIGINT")
+
+    logger.info("시퀀스 정보 매핑 중...")
+
+    # last_expire에 해당하는 트랜잭션의 시퀀스 정보 찾기
+    # 1. last_expire와 membership_expire_date가 일치하는 트랜잭션 찾기
+    # 2. 해당 트랜잭션이 is_cancel=1이면, is_cancel=0인 가장 최근 트랜잭션 찾기
+    con.execute(f"""
+        WITH matched_txn AS (
+            -- last_expire와 일치하는 모든 트랜잭션 찾기
+            SELECT
+                m.user_id,
+                m.last_expire,
+                t.transaction_date,
+                t.membership_expire_date,
+                t.sequence_group_id,
+                t.sequence_id,
+                t.is_cancel,
+                ROW_NUMBER() OVER (
+                    PARTITION BY m.user_id
+                    ORDER BY t.transaction_date DESC, t.sequence_id DESC
+                ) AS rn
+            FROM {members_table} m
+            JOIN {seq_table} t ON m.user_id = t.user_id
+                AND m.last_expire = t.membership_expire_date
+            WHERE m.last_expire IS NOT NULL
+        ),
+        last_expire_txn AS (
+            -- 각 유저의 last_expire에 해당하는 가장 마지막 트랜잭션
+            SELECT * FROM matched_txn WHERE rn = 1
+        ),
+        non_cancel_fallback AS (
+            -- is_cancel=1인 유저의 경우, is_cancel=0인 가장 최근 트랜잭션 찾기
+            SELECT
+                l.user_id,
+                t2.sequence_group_id AS fallback_seq_group_id,
+                t2.sequence_id AS fallback_seq_id,
+                ROW_NUMBER() OVER (
+                    PARTITION BY l.user_id
+                    ORDER BY t2.transaction_date DESC, t2.sequence_id DESC
+                ) AS rn2
+            FROM last_expire_txn l
+            JOIN {seq_table} t2 ON l.user_id = t2.user_id
+                AND t2.is_cancel = 0
+                AND t2.transaction_date <= l.transaction_date
+            WHERE l.is_cancel = 1
+        ),
+        final_mapping AS (
+            -- 최종 매핑: is_cancel=1이면 fallback 사용, 아니면 원래 값 사용
+            SELECT
+                l.user_id,
+                CASE
+                    WHEN l.is_cancel = 1 AND nc.fallback_seq_group_id IS NOT NULL
+                        THEN nc.fallback_seq_group_id
+                    ELSE l.sequence_group_id
+                END AS final_seq_group_id,
+                CASE
+                    WHEN l.is_cancel = 1 AND nc.fallback_seq_id IS NOT NULL
+                        THEN nc.fallback_seq_id
+                    ELSE l.sequence_id
+                END AS final_seq_id
+            FROM last_expire_txn l
+            LEFT JOIN non_cancel_fallback nc ON l.user_id = nc.user_id AND nc.rn2 = 1
+        )
+        UPDATE {members_table} m
+        SET
+            membership_seq_group_id = fm.final_seq_group_id,
+            membership_seq_id = fm.final_seq_id
+        FROM final_mapping fm
+        WHERE m.user_id = fm.user_id;
+    """)
+
+    # 결과 통계
+    total_members = con.execute(f"SELECT COUNT(*) FROM {members_table}").fetchone()[0]
+    with_seq = con.execute(f"""
+        SELECT COUNT(*) FROM {members_table}
+        WHERE membership_seq_group_id IS NOT NULL
+    """).fetchone()[0]
+    without_seq = total_members - with_seq
+
+    logger.info(f"전체 멤버: {total_members:,}")
+    logger.info(f"시퀀스 정보 매핑됨: {with_seq:,}")
+    logger.info(f"시퀀스 정보 없음: {without_seq:,}")
+
+    # 샘플 데이터 출력
+    sample = con.execute(f"""
+        SELECT m.user_id, m.last_expire, m.membership_seq_group_id, m.membership_seq_id,
+               t.is_cancel, t.is_churn
+        FROM {members_table} m
+        LEFT JOIN {seq_table} t ON m.user_id = t.user_id
+            AND m.membership_seq_group_id = t.sequence_group_id
+            AND m.membership_seq_id = t.sequence_id
+        WHERE m.membership_seq_group_id IS NOT NULL
+        LIMIT 10
+    """).fetchdf()
+    logger.info(f"샘플 데이터:\n{sample.to_string()}")
 
     con.close()
-    logger.info(f"=========================\n")
+    logger.info(f"=== 멤버십 시퀀스 정보 추가 완료 ===\n")
+
+
+# ============================================================================
+# 8.7. members_merge에 멤버십 기간 정보 추가
+# ============================================================================
+def add_membership_duration_info(
+    db_path: str,
+    members_table: str = "members_merge",
+    seq_table: str = "transactions_seq",
+) -> None:
+    """
+    members_merge 테이블에 멤버십 기간 정보를 추가합니다.
+
+    Args:
+        db_path: DuckDB 데이터베이스 경로
+        members_table: 멤버 테이블명 (기본값: members_merge)
+        seq_table: 시퀀스 테이블명 (기본값: transactions_seq)
+
+    추가되는 컬럼:
+        - previous_membership_duration: 직전 멤버십 시작(transaction_date) ~ last_expire 기간 (days)
+        - previous_membership_seq_duration: 시퀀스 그룹 시작 ~ last_expire 기간 (days)
+    """
+    logger.info(f"=== 멤버십 기간 정보 추가 시작 ===")
+    logger.info(f"대상 테이블: {members_table}")
+    logger.info(f"시퀀스 테이블: {seq_table}")
+
+    con = duckdb.connect(db_path)
+    con.execute("PRAGMA threads=8;")
+
+    # 테이블 존재 확인
+    existing_tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
+    if members_table not in existing_tables:
+        logger.error(f"테이블 {members_table}이 존재하지 않습니다.")
+        con.close()
+        return
+    if seq_table not in existing_tables:
+        logger.error(f"테이블 {seq_table}이 존재하지 않습니다.")
+        con.close()
+        return
+
+    # 기존 컬럼 삭제 (있으면)
+    cols = [row[0] for row in con.execute(f"DESCRIBE {members_table}").fetchall()]
+    if "previous_membership_duration" in cols:
+        con.execute(f"ALTER TABLE {members_table} DROP COLUMN previous_membership_duration")
+        logger.info("기존 previous_membership_duration 컬럼 삭제")
+    if "previous_membership_seq_duration" in cols:
+        con.execute(f"ALTER TABLE {members_table} DROP COLUMN previous_membership_seq_duration")
+        logger.info("기존 previous_membership_seq_duration 컬럼 삭제")
+
+    # 새 컬럼 추가
+    con.execute(f"ALTER TABLE {members_table} ADD COLUMN previous_membership_duration BIGINT")
+    con.execute(f"ALTER TABLE {members_table} ADD COLUMN previous_membership_seq_duration BIGINT")
+
+    logger.info("멤버십 기간 계산 중...")
+
+    # 기간 계산
+    # 1. previous_membership_duration: membership_seq_id 트랜잭션의 transaction_date ~ last_expire
+    # 2. previous_membership_seq_duration: 시퀀스 그룹 첫 트랜잭션(seq_id=0)의 transaction_date ~ last_expire
+    con.execute(f"""
+        WITH membership_txn AS (
+            -- 각 유저의 membership_seq_id에 해당하는 트랜잭션 정보
+            SELECT
+                m.user_id,
+                m.last_expire,
+                t.transaction_date AS membership_start_date
+            FROM {members_table} m
+            JOIN {seq_table} t ON m.user_id = t.user_id
+                AND m.membership_seq_group_id = t.sequence_group_id
+                AND m.membership_seq_id = t.sequence_id
+            WHERE m.membership_seq_group_id IS NOT NULL
+        ),
+        seq_start AS (
+            -- 각 유저의 시퀀스 그룹 시작일 (sequence_id = 0인 트랜잭션)
+            SELECT
+                m.user_id,
+                t.transaction_date AS seq_start_date
+            FROM {members_table} m
+            JOIN {seq_table} t ON m.user_id = t.user_id
+                AND m.membership_seq_group_id = t.sequence_group_id
+                AND t.sequence_id = 0
+            WHERE m.membership_seq_group_id IS NOT NULL
+        ),
+        duration_calc AS (
+            SELECT
+                mt.user_id,
+                mt.last_expire - mt.membership_start_date AS membership_duration,
+                mt.last_expire - ss.seq_start_date AS seq_duration
+            FROM membership_txn mt
+            JOIN seq_start ss ON mt.user_id = ss.user_id
+        )
+        UPDATE {members_table} m
+        SET
+            previous_membership_duration = dc.membership_duration,
+            previous_membership_seq_duration = dc.seq_duration
+        FROM duration_calc dc
+        WHERE m.user_id = dc.user_id;
+    """)
+
+    # 결과 통계
+    stats = con.execute(f"""
+        SELECT
+            COUNT(*) AS total,
+            COUNT(previous_membership_duration) AS with_duration,
+            AVG(previous_membership_duration) AS avg_membership_duration,
+            AVG(previous_membership_seq_duration) AS avg_seq_duration,
+            MIN(previous_membership_duration) AS min_membership_duration,
+            MAX(previous_membership_duration) AS max_membership_duration,
+            MIN(previous_membership_seq_duration) AS min_seq_duration,
+            MAX(previous_membership_seq_duration) AS max_seq_duration
+        FROM {members_table}
+    """).fetchone()
+
+    logger.info(f"전체 멤버: {stats[0]:,}")
+    logger.info(f"기간 정보 매핑됨: {stats[1]:,}")
+    logger.info(f"previous_membership_duration - 평균: {stats[2]:.1f}일, 범위: {stats[4]}~{stats[5]}일")
+    logger.info(f"previous_membership_seq_duration - 평균: {stats[3]:.1f}일, 범위: {stats[6]}~{stats[7]}일")
+
+    # 샘플 데이터 출력
+    sample = con.execute(f"""
+        SELECT user_id, last_expire, membership_seq_group_id, membership_seq_id,
+               previous_membership_duration, previous_membership_seq_duration
+        FROM {members_table}
+        WHERE previous_membership_duration IS NOT NULL
+        ORDER BY previous_membership_seq_duration DESC
+        LIMIT 10
+    """).fetchdf()
+    logger.info(f"샘플 데이터 (시퀀스 기간 긴 순):\n{sample.to_string()}")
+
+    con.close()
+    logger.info(f"=== 멤버십 기간 정보 추가 완료 ===\n")
 
 
 # ============================================================================
@@ -2180,61 +2055,132 @@ if __name__ == "__main__":
     #     max_val=86400,
     # )
 
-    analyze_feature_correlation(
-        db_path=DB_PATH,
-        table_name="user_logs_merge",
-        output_dir="data/analysis",
-        exclude_cols=["user_id"],
-        # sample_size=100000,  # 대용량 테이블은 샘플링 권장
-        corr_threshold=0.7,
-        null_values={
-            "total_secs": {"min": 0, "max": 86400},
-        },
-    )
-    analyze_feature_correlation(
-        db_path=DB_PATH,
-        table_name="members_merge",
-        output_dir="data/analysis",
-        exclude_cols=["user_id"],
-        # sample_size=100000,  # 대용량 테이블은 샘플링 권장
-        corr_threshold=0.7,
-        null_values={
-            "gender": [-1],              # -1을 NULL로
-            "bd": {"min": 0, "max": 100},                   # 0-100 범위 밖을 NULL로
-        },
-    )
-
-    # # 9. Parquet 내보내기
-    # export_to_parquet(
+    # analyze_feature_correlation(
     #     db_path=DB_PATH,
-    #     output_dir=PARQUET_DIR,
-    #     tables=[
-    #         # "raw_train_v1",
-    #         # "raw_train_v2",
-    #         # "raw_transactions_v1",
-    #         # "raw_transactions_v2",
-    #         # "raw_user_logs_v1",
-    #         # "raw_user_logs_v2",
-    #         # "raw_members_v3",
-
-    #         # "train_v1",
-    #         # "train_v2",
-    #         # "transactions_v1",
-    #         # "transactions_v2",
-    #         # "user_logs_v1",
-    #         # "user_logs_v2",
-    #         # "members_v3",
-
-    #         "train_merge",
-    #         "transactions_merge",
-    #         "user_logs_merge",
-    #         "members_merge",
-
-    #         "user_id_map",
-
-    #         "user_logs_with_transactions"
-    #     ],
+    #     table_name="user_logs_merge",
+    #     output_dir="data/analysis",
+    #     exclude_cols=["user_id"],
+    #     # sample_size=100000,  # 대용량 테이블은 샘플링 권장
+    #     corr_threshold=0.7,
+    #     null_values={
+    #         "total_secs": {"min": 0, "max": 86400},
+    #     },
     # )
+    # analyze_feature_correlation(
+    #     db_path=DB_PATH,
+    #     table_name="members_merge",
+    #     output_dir="data/analysis",
+    #     exclude_cols=["user_id"],
+    #     # sample_size=100000,  # 대용량 테이블은 샘플링 권장
+    #     corr_threshold=0.7,
+    #     null_values={
+    #         "gender": [-1],              # -1을 NULL로
+    #         "bd": {"min": 0, "max": 100},                   # 0-100 범위 밖을 NULL로
+    #     },
+    # )
+
+    # # 8.5. 트랜잭션 시퀀스 테이블 생성
+    # create_transactions_seq(
+    #     db_path=DB_PATH,
+    #     source_table="transactions_merge",
+    #     target_table="transactions_seq",
+    #     gap_days=30,
+    #     cutoff_date="2017-03-31",
+    # )
+
+    # # 8.6. members_merge에 멤버십 시퀀스 정보 추가
+    # add_membership_seq_info(
+    #     db_path=DB_PATH,
+    #     members_table="members_merge",
+    #     seq_table="transactions_seq",
+    # )
+
+    # # 8.7. members_merge에 멤버십 기간 정보 추가
+    # add_membership_duration_info(
+    #     db_path=DB_PATH,
+    #     members_table="members_merge",
+    #     seq_table="transactions_seq",
+    # )
+
+    # # 8.8. user_logs_merge에 total_hours 컬럼 추가
+    # add_converted_column(
+    #     db_path=DB_PATH,
+    #     table_name="user_logs_merge",
+    #     source_col="total_secs",
+    #     target_col="total_hours",
+    #     divisor=3600,
+    #     # clip_min=0,
+    #     # clip_max=24,
+    #     force_overwrite=True,
+    # )
+
+    # # 8.9. Feature 클리핑 구간 분석
+    # analyze_clipping_distribution(
+    #     db_path=DB_PATH,
+    #     table_name="user_logs_merge",
+    #     column_name="total_secs",
+    #     output_dir="data/analysis",
+    #     clip_min=0,
+    #     clip_max=86400,  # 24시간 = 86400초
+    #     sample_size=1_000_000,  # 대용량 테이블은 샘플링 권장
+    # )
+
+    # 8.10. 조건부 데이터 변환 (이상치 처리 등)
+    # apply_conditional_transform(
+    #     db_path=DB_PATH,
+    #     table_name="user_logs_merge",
+    #     rules=[
+    #         # 음수 total_secs 값을 NULL로 변환
+    #         {
+    #             "column": "total_secs",
+    #             "operator": "<",
+    #             "value": 0,
+    #             "action": "delete_row",
+    #         },
+    #         # 24시간(86400초) 초과 값을 86400으로 클리핑
+    #         {
+    #             "column": "total_secs",
+    #             "operator": ">",
+    #             "value": 86400,
+    #             "action": "set_value",
+    #             "new_value": 86400,
+    #         },
+    #     ],
+    #     dry_run=False,  # True로 설정하면 실제 변경 없이 영향 행 수만 출력
+    # )
+
+    # 9. Parquet 내보내기
+    export_to_parquet(
+        db_path=DB_PATH,
+        output_dir=PARQUET_DIR,
+        tables=[
+            # "raw_train_v1",
+            # "raw_train_v2",
+            # "raw_transactions_v1",
+            # "raw_transactions_v2",
+            # "raw_user_logs_v1",
+            # "raw_user_logs_v2",
+            # "raw_members_v3",
+
+            # "train_v1",
+            # "train_v2",
+            # "transactions_v1",
+            # "transactions_v2",
+            # "user_logs_v1",
+            # "user_logs_v2",
+            # "members_v3",
+
+            "train_merge",
+            "transactions_merge",
+            "user_logs_merge",
+            "members_merge",
+            "transactions_seq",
+
+            # "user_id_map",
+
+            # "user_logs_with_transactions"
+        ],
+    )
 
     # (선택) 최종 데이터베이스 정보 출력
     show_database_info(db_path=DB_PATH)
