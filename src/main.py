@@ -5418,12 +5418,12 @@ if __name__ == "__main__":
     #     seq_table="transactions_seq",
     # )
 
-    # # 8.6. members_merge에 멤버십 시퀀스 정보 추가
-    # add_membership_seq_info(
-    #     db_path=DB_PATH,
-    #     members_table="members_merge",
-    #     seq_table="transactions_seq",
-    # )
+    # 8.6. members_merge에 멤버십 시퀀스 정보 추가
+    add_membership_seq_info(
+        db_path=DB_PATH,
+        members_table="members_merge",
+        seq_table="transactions_seq",
+    )
 
     # # 8.7. members_merge에 멤버십 기간 정보 추가
     # add_membership_duration_info(
@@ -5432,17 +5432,17 @@ if __name__ == "__main__":
     #     seq_table="transactions_seq",
     # )
 
-    # 8.8. user_logs_merge에 total_hours 컬럼 추가
-    add_converted_column(
-        db_path=DB_PATH,
-        table_name="user_logs_merge",
-        source_col="total_secs",
-        target_col="total_hours",
-        divisor=3600,
-        # clip_min=0,
-        # clip_max=24,
-        force_overwrite=True,
-    )
+    # # 8.8. user_logs_merge에 total_hours 컬럼 추가
+    # add_converted_column(
+    #     db_path=DB_PATH,
+    #     table_name="user_logs_merge",
+    #     source_col="total_secs",
+    #     target_col="total_hours",
+    #     divisor=3600,
+    #     # clip_min=0,
+    #     # clip_max=24,
+    #     force_overwrite=True,
+    # )
 
     # # 8.9. Feature 클리핑 구간 분석
     # analyze_clipping_distribution(
