@@ -22,6 +22,7 @@ KKBox 데이터 전처리 파이프라인
 import os
 import sys
 import logging
+import matplotlib.pyplot as plt
 from typing import Optional
 
 import duckdb
@@ -153,7 +154,7 @@ def create_merge_tables(
         v1_name = f"{base}_v1"
         v2_name = f"{base}_v2"
         v3_name = f"{base}_v3"
-        merge_name = f"{base}_merge"
+        merge_name = f"{base.replace('raw_', '')}_merge"
 
         v1_exists = v1_name in tables
         v2_exists = v2_name in tables
@@ -162,7 +163,7 @@ def create_merge_tables(
         logger.info(f"  {base}: v1={v1_exists}, v2={v2_exists}, v3={v3_exists}")
 
         # members 특수 처리: members_v3 -> members_merge
-        if base == "members":
+        if base == "raw_members":
             if v3_exists:
                 con.execute(f"""
                     CREATE OR REPLACE TABLE {merge_name} AS
@@ -175,7 +176,7 @@ def create_merge_tables(
             continue
 
         # train 특수 처리: v2 우선 업데이트
-        if base == "train":
+        if base == "raw_train":
             if v1_exists and v2_exists:
                 con.execute(f"""
                     CREATE OR REPLACE TABLE {merge_name} AS
@@ -843,6 +844,320 @@ def exclude_duplicate_transaction_users(
 
     con.close()
     logger.info(f"=== 중복 트랜잭션 유저 제외 완료 ===\n")
+
+
+def exclude_null_total_secs_users(
+    db_path: str,
+    logs_table: str = "user_logs_merge",
+    target_tables: list[str] = None,
+) -> None:
+    """
+    user_logs_merge에서 total_secs가 NULL인 유저를 모든 _merge 테이블에서 제외합니다.
+
+    Args:
+        db_path: DuckDB 데이터베이스 경로
+        logs_table: 로그 테이블 이름 (기본값: user_logs_merge)
+        target_tables: 필터링을 적용할 대상 테이블 이름 리스트
+                       기본값: ["train_merge", "transactions_merge", "user_logs_merge", "members_merge"]
+    """
+    if target_tables is None:
+        target_tables = ["train_merge", "transactions_merge", "user_logs_merge", "members_merge"]
+
+    logger.info(f"=== NULL total_secs 유저 제외 시작 ===")
+    logger.info(f"로그 테이블: {logs_table}")
+    logger.info(f"대상 테이블: {target_tables}")
+
+    con = duckdb.connect(db_path)
+    con.execute("PRAGMA threads=8;")
+
+    existing_tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
+
+    # 로그 테이블 존재 확인
+    if logs_table not in existing_tables:
+        logger.error(f"{logs_table} 테이블이 존재하지 않습니다.")
+        con.close()
+        return
+
+    # 로그 테이블의 user_id 컬럼 확인
+    logs_cols = [row[0] for row in con.execute(f"DESCRIBE {logs_table}").fetchall()]
+    if "user_id" in logs_cols:
+        id_col = "user_id"
+    elif "msno" in logs_cols:
+        id_col = "msno"
+    else:
+        logger.error(f"{logs_table}에 user_id/msno 컬럼이 없습니다.")
+        con.close()
+        return
+
+    # 전체 유저 수
+    total_users = con.execute(f"""
+        SELECT COUNT(DISTINCT {id_col}) FROM {logs_table}
+    """).fetchone()[0]
+    logger.info(f"로그 테이블 전체 유저 수: {total_users:,}")
+
+    # NULL total_secs가 있는 유저 추출
+    con.execute(f"""
+        CREATE OR REPLACE TABLE _null_total_secs_users_temp AS
+        SELECT DISTINCT {id_col}
+        FROM {logs_table}
+        WHERE total_secs IS NULL;
+    """)
+
+    null_user_count = con.execute("SELECT COUNT(*) FROM _null_total_secs_users_temp").fetchone()[0]
+    logger.info(f"NULL total_secs 유저 수: {null_user_count:,} ({null_user_count/total_users*100:.2f}%)")
+
+    if null_user_count == 0:
+        logger.info("제외할 유저가 없습니다.")
+        con.execute("DROP TABLE IF EXISTS _null_total_secs_users_temp;")
+        con.close()
+        return
+
+    # 대상 테이블에서 NULL 유저 제외
+    for t in tqdm(target_tables, desc="NULL total_secs 유저 제외"):
+        if t not in existing_tables:
+            logger.warning(f"  {t}: 존재하지 않음, 건너뜀")
+            continue
+
+        # 대상 테이블의 user_id 컬럼 확인
+        target_cols = [row[0] for row in con.execute(f"DESCRIBE {t}").fetchall()]
+        if "user_id" in target_cols:
+            target_col = "user_id"
+        elif "msno" in target_cols:
+            target_col = "msno"
+        else:
+            logger.warning(f"  {t}: user_id/msno 컬럼 없음, 건너뜀")
+            continue
+
+        logger.info(f"  {t} 필터링 중...")
+
+        # 필터링 전 통계
+        before_rows = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+        before_unique = con.execute(f"SELECT COUNT(DISTINCT {target_col}) FROM {t}").fetchone()[0]
+
+        # NULL 유저 제외 (NOT IN)
+        con.execute(f"""
+            CREATE OR REPLACE TABLE {t}_filtered AS
+            SELECT *
+            FROM {t}
+            WHERE {target_col} NOT IN (SELECT {id_col} FROM _null_total_secs_users_temp);
+        """)
+
+        # 원본 테이블 교체
+        con.execute(f"DROP TABLE {t};")
+        con.execute(f"ALTER TABLE {t}_filtered RENAME TO {t};")
+
+        # 필터링 후 통계
+        after_rows = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+        after_unique = con.execute(f"SELECT COUNT(DISTINCT {target_col}) FROM {t}").fetchone()[0]
+
+        rows_removed = before_rows - after_rows
+        users_removed = before_unique - after_unique
+
+        logger.info(f"    {before_rows:,} -> {after_rows:,} 행 ({rows_removed:,} 제거)")
+        logger.info(f"    {before_unique:,} -> {after_unique:,} 고유 유저 ({users_removed:,} 제거)")
+
+    # 임시 테이블 삭제
+    con.execute("DROP TABLE IF EXISTS _null_total_secs_users_temp;")
+
+    con.close()
+    logger.info(f"=== NULL total_secs 유저 제외 완료 ===\n")
+
+
+def analyze_plan_days_30_31_users(
+    db_path: str,
+    transactions_table: str = "transactions_merge",
+) -> None:
+    """
+    plan_days가 30, 31인 트랜잭션만 가진 유저 수를 분석합니다.
+
+    Args:
+        db_path: DuckDB 데이터베이스 경로
+        transactions_table: 트랜잭션 테이블 이름 (기본값: transactions_merge)
+    """
+    logger.info(f"=== plan_days 30/31 유저 분석 시작 ===")
+    logger.info(f"트랜잭션 테이블: {transactions_table}")
+
+    con = duckdb.connect(db_path)
+    con.execute("PRAGMA threads=8;")
+
+    existing_tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
+
+    if transactions_table not in existing_tables:
+        logger.error(f"{transactions_table} 테이블이 존재하지 않습니다.")
+        con.close()
+        return
+
+    # 전체 유저 수
+    total_users = con.execute(f"""
+        SELECT COUNT(DISTINCT user_id) FROM {transactions_table}
+    """).fetchone()[0]
+    logger.info(f"전체 유저 수: {total_users:,}")
+
+    # plan_days가 30 또는 31인 트랜잭션만 가진 유저 수
+    only_30_31_users = con.execute(f"""
+        WITH user_plan_days AS (
+            SELECT user_id, ARRAY_AGG(DISTINCT payment_plan_days) AS plan_days_list
+            FROM {transactions_table}
+            GROUP BY user_id
+        )
+        SELECT COUNT(*)
+        FROM user_plan_days
+        WHERE list_sort(plan_days_list) = [30]
+           OR list_sort(plan_days_list) = [31]
+           OR list_sort(plan_days_list) = [30, 31]
+    """).fetchone()[0]
+
+    logger.info(f"plan_days 30/31만 가진 유저 수: {only_30_31_users:,} ({only_30_31_users/total_users*100:.2f}%)")
+
+    # 상세 분포
+    plan_days_dist = con.execute(f"""
+        WITH user_plan_days AS (
+            SELECT user_id, ARRAY_AGG(DISTINCT payment_plan_days ORDER BY payment_plan_days) AS plan_days_list
+            FROM {transactions_table}
+            GROUP BY user_id
+        )
+        SELECT
+            CASE
+                WHEN plan_days_list = [30] THEN 'only_30'
+                WHEN plan_days_list = [31] THEN 'only_31'
+                WHEN plan_days_list = [30, 31] THEN 'both_30_31'
+                ELSE 'other'
+            END AS category,
+            COUNT(*) AS user_count
+        FROM user_plan_days
+        GROUP BY category
+        ORDER BY user_count DESC
+    """).fetchall()
+
+    logger.info(f"상세 분포:")
+    for category, count in plan_days_dist:
+        logger.info(f"  {category}: {count:,} ({count/total_users*100:.2f}%)")
+
+    con.close()
+    logger.info(f"=== plan_days 30/31 유저 분석 완료 ===\n")
+
+
+def exclude_out_of_range_expire_date_users(
+    db_path: str,
+    transactions_table: str = "transactions_merge",
+    target_tables: list[str] = None,
+    min_year: int = 2015,
+    max_year: int = 2017,
+) -> None:
+    """
+    membership_expire_date가 지정된 연도 범위를 벗어나는 유저를 모든 _merge 테이블에서 제외합니다.
+
+    Args:
+        db_path: DuckDB 데이터베이스 경로
+        transactions_table: 트랜잭션 테이블 이름 (기본값: transactions_merge)
+        target_tables: 필터링을 적용할 대상 테이블 이름 리스트
+                       기본값: ["train_merge", "transactions_merge", "user_logs_merge", "members_merge"]
+        min_year: 최소 연도 (포함, 기본값: 2015)
+        max_year: 최대 연도 (포함, 기본값: 2017)
+    """
+    if target_tables is None:
+        target_tables = ["train_merge", "transactions_merge", "user_logs_merge", "members_merge"]
+
+    logger.info(f"=== membership_expire_date 범위 밖 유저 제외 시작 ===")
+    logger.info(f"트랜잭션 테이블: {transactions_table}")
+    logger.info(f"연도 범위: [{min_year}, {max_year}]")
+    logger.info(f"대상 테이블: {target_tables}")
+
+    con = duckdb.connect(db_path)
+    con.execute("PRAGMA threads=8;")
+
+    existing_tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
+
+    # 트랜잭션 테이블 존재 확인
+    if transactions_table not in existing_tables:
+        logger.error(f"{transactions_table} 테이블이 존재하지 않습니다.")
+        con.close()
+        return
+
+    # 트랜잭션 테이블의 user_id 컬럼 확인
+    tx_cols = [row[0] for row in con.execute(f"DESCRIBE {transactions_table}").fetchall()]
+    if "user_id" in tx_cols:
+        id_col = "user_id"
+    elif "msno" in tx_cols:
+        id_col = "msno"
+    else:
+        logger.error(f"{transactions_table}에 user_id/msno 컬럼이 없습니다.")
+        con.close()
+        return
+
+    # 전체 유저 수
+    total_users = con.execute(f"""
+        SELECT COUNT(DISTINCT {id_col}) FROM {transactions_table}
+    """).fetchone()[0]
+    logger.info(f"트랜잭션 테이블 전체 유저 수: {total_users:,}")
+
+    # 범위 밖 membership_expire_date를 가진 유저 추출
+    con.execute(f"""
+        CREATE OR REPLACE TABLE _out_of_range_expire_users_temp AS
+        SELECT DISTINCT {id_col}
+        FROM {transactions_table}
+        WHERE YEAR(membership_expire_date) < {min_year}
+           OR YEAR(membership_expire_date) > {max_year};
+    """)
+
+    out_of_range_count = con.execute("SELECT COUNT(*) FROM _out_of_range_expire_users_temp").fetchone()[0]
+    logger.info(f"범위 밖 유저 수: {out_of_range_count:,} ({out_of_range_count/total_users*100:.2f}%)")
+
+    if out_of_range_count == 0:
+        logger.info("제외할 유저가 없습니다.")
+        con.execute("DROP TABLE IF EXISTS _out_of_range_expire_users_temp;")
+        con.close()
+        return
+
+    # 대상 테이블에서 범위 밖 유저 제외
+    for t in tqdm(target_tables, desc="범위 밖 expire_date 유저 제외"):
+        if t not in existing_tables:
+            logger.warning(f"  {t}: 존재하지 않음, 건너뜀")
+            continue
+
+        # 대상 테이블의 user_id 컬럼 확인
+        target_cols = [row[0] for row in con.execute(f"DESCRIBE {t}").fetchall()]
+        if "user_id" in target_cols:
+            target_col = "user_id"
+        elif "msno" in target_cols:
+            target_col = "msno"
+        else:
+            logger.warning(f"  {t}: user_id/msno 컬럼 없음, 건너뜀")
+            continue
+
+        logger.info(f"  {t} 필터링 중...")
+
+        # 필터링 전 통계
+        before_rows = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+        before_unique = con.execute(f"SELECT COUNT(DISTINCT {target_col}) FROM {t}").fetchone()[0]
+
+        # 범위 밖 유저 제외 (NOT IN)
+        con.execute(f"""
+            CREATE OR REPLACE TABLE {t}_filtered AS
+            SELECT *
+            FROM {t}
+            WHERE {target_col} NOT IN (SELECT {id_col} FROM _out_of_range_expire_users_temp);
+        """)
+
+        # 원본 테이블 교체
+        con.execute(f"DROP TABLE {t};")
+        con.execute(f"ALTER TABLE {t}_filtered RENAME TO {t};")
+
+        # 필터링 후 통계
+        after_rows = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+        after_unique = con.execute(f"SELECT COUNT(DISTINCT {target_col}) FROM {t}").fetchone()[0]
+
+        rows_removed = before_rows - after_rows
+        users_removed = before_unique - after_unique
+
+        logger.info(f"    {before_rows:,} -> {after_rows:,} 행 ({rows_removed:,} 제거)")
+        logger.info(f"    {before_unique:,} -> {after_unique:,} 고유 유저 ({users_removed:,} 제거)")
+
+    # 임시 테이블 삭제
+    con.execute("DROP TABLE IF EXISTS _out_of_range_expire_users_temp;")
+
+    con.close()
+    logger.info(f"=== membership_expire_date 범위 밖 유저 제외 완료 ===\n")
 
 
 # ============================================================================
@@ -1567,6 +1882,2869 @@ def create_transactions_seq(
 
 
 # ============================================================================
+# 8.5.1. transactions_seq에 actual_plan_days 추가
+# ============================================================================
+def add_actual_plan_days(
+    db_path: str,
+    seq_table: str = "transactions_seq",
+) -> None:
+    """
+    transactions_seq 테이블에 actual_plan_days 컬럼을 추가합니다.
+
+    payment_plan_days는 결제 상품의 기간이지만, 실제 멤버십 연장 기간과 다를 수 있습니다.
+    actual_plan_days는 실제로 멤버십이 연장되는 기간을 계산합니다:
+
+    - 직전 멤버십 만료 후 트랜잭션 (transaction_date > prev_expire_date):
+      actual_plan_days = membership_expire_date - transaction_date
+
+    - 직전 멤버십 만료 전 트랜잭션 (transaction_date <= prev_expire_date):
+      actual_plan_days = membership_expire_date - prev_expire_date
+
+    - 유저의 첫 트랜잭션 (prev_expire_date 없음):
+      actual_plan_days = membership_expire_date - transaction_date
+
+    Args:
+        db_path: DuckDB 데이터베이스 경로
+        seq_table: 트랜잭션 시퀀스 테이블명 (기본값: transactions_seq)
+    """
+    logger.info(f"=== {seq_table}에 actual_plan_days 추가 시작 ===")
+
+    con = duckdb.connect(db_path)
+    con.execute("PRAGMA threads=8;")
+
+    # 테이블 존재 확인
+    existing_tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
+    if seq_table not in existing_tables:
+        logger.error(f"테이블 {seq_table}이 존재하지 않습니다.")
+        con.close()
+        return
+
+    # 이미 컬럼이 존재하는지 확인
+    columns = [row[0] for row in con.execute(f"DESCRIBE {seq_table}").fetchall()]
+    if "actual_plan_days" in columns:
+        logger.info("actual_plan_days 컬럼이 이미 존재합니다. 재계산합니다.")
+        con.execute(f"ALTER TABLE {seq_table} DROP COLUMN actual_plan_days")
+
+    # actual_plan_days 계산 및 추가
+    logger.info("actual_plan_days 계산 중...")
+
+    con.execute(f"""
+        -- 임시 테이블에 actual_plan_days 계산
+        CREATE OR REPLACE TABLE {seq_table}_temp AS
+        WITH with_prev_expire AS (
+            SELECT
+                *,
+                LAG(membership_expire_date) OVER (
+                    PARTITION BY user_id
+                    ORDER BY transaction_date, membership_expire_date
+                ) AS prev_expire_date
+            FROM {seq_table}
+        )
+        SELECT
+            *,
+            CAST(
+                CASE
+                    -- 유저의 첫 트랜잭션 (이전 만료일 없음)
+                    WHEN prev_expire_date IS NULL THEN
+                        membership_expire_date - transaction_date
+
+                    -- 멤버십 만료 후 트랜잭션 (갱신 전 이탈 기간 있음)
+                    WHEN transaction_date > prev_expire_date THEN
+                        membership_expire_date - transaction_date
+
+                    -- 멤버십 만료 전 트랜잭션 (연속 갱신)
+                    ELSE
+                        membership_expire_date - prev_expire_date
+                END AS BIGINT
+            ) AS actual_plan_days
+        FROM with_prev_expire;
+    """)
+
+    # prev_expire_date 컬럼 제거하고 원본 테이블 교체
+    con.execute(f"""
+        CREATE OR REPLACE TABLE {seq_table} AS
+        SELECT
+            user_id,
+            payment_method_id,
+            payment_plan_days,
+            plan_list_price,
+            actual_amount_paid,
+            is_auto_renew,
+            transaction_date,
+            membership_expire_date,
+            is_cancel,
+            sequence_group_id,
+            sequence_id,
+            before_transaction_term,
+            before_membership_expire_term,
+            is_churn,
+            actual_plan_days
+        FROM {seq_table}_temp
+        ORDER BY user_id, transaction_date, membership_expire_date;
+    """)
+
+    # 임시 테이블 삭제
+    con.execute(f"DROP TABLE IF EXISTS {seq_table}_temp")
+
+    # 결과 통계
+    stats = con.execute(f"""
+        SELECT
+            COUNT(*) AS total_rows,
+            AVG(actual_plan_days) AS avg_actual,
+            AVG(payment_plan_days) AS avg_payment,
+            SUM(CASE WHEN actual_plan_days != payment_plan_days THEN 1 ELSE 0 END) AS diff_count,
+            MIN(actual_plan_days) AS min_actual,
+            MAX(actual_plan_days) AS max_actual
+        FROM {seq_table}
+    """).fetchone()
+
+    logger.info(f"추가 완료: {stats[0]:,} 행")
+    logger.info(f"actual_plan_days 통계:")
+    logger.info(f"  평균: {stats[1]:.1f}일 (payment_plan_days 평균: {stats[2]:.1f}일)")
+    logger.info(f"  범위: [{stats[4]}, {stats[5]}]일")
+    logger.info(f"  payment_plan_days와 다른 행: {stats[3]:,} ({100*stats[3]/stats[0]:.1f}%)")
+
+    # 차이 분포 샘플
+    diff_sample = con.execute(f"""
+        SELECT
+            payment_plan_days,
+            actual_plan_days,
+            actual_plan_days - payment_plan_days AS diff,
+            COUNT(*) AS cnt
+        FROM {seq_table}
+        WHERE actual_plan_days != payment_plan_days
+        GROUP BY payment_plan_days, actual_plan_days
+        ORDER BY cnt DESC
+        LIMIT 10
+    """).fetchdf()
+    if len(diff_sample) > 0:
+        logger.info(f"차이 분포 (상위 10개):\n{diff_sample.to_string()}")
+
+    con.close()
+    logger.info(f"=== {seq_table}에 actual_plan_days 추가 완료 ===\n")
+
+
+# ============================================================================
+# 8.5.2. actual_plan_days 분석
+# ============================================================================
+def analyze_actual_plan_days(
+    db_path: str,
+    seq_table: str = "transactions_seq",
+    output_dir: str = "data/analysis",
+) -> None:
+    """
+    actual_plan_days의 음수/0/양수 분포 및 추가 통계를 분석합니다.
+
+    Args:
+        db_path: DuckDB 데이터베이스 경로
+        seq_table: 트랜잭션 시퀀스 테이블명 (기본값: transactions_seq)
+        output_dir: 그래프 저장 디렉토리 (기본값: data/analysis)
+    """
+    import matplotlib.pyplot as plt
+
+    logger.info(f"=== actual_plan_days 분석 시작 ===")
+    logger.info(f"테이블: {seq_table}")
+    logger.info(f"출력 디렉토리: {output_dir}")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    con = duckdb.connect(db_path)
+    con.execute("PRAGMA threads=8;")
+
+    # 테이블 존재 확인
+    existing_tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
+    if seq_table not in existing_tables:
+        logger.error(f"테이블 {seq_table}이 존재하지 않습니다.")
+        con.close()
+        return
+
+    # 전체 행/유저 수
+    total_stats = con.execute(f"""
+        SELECT COUNT(*) AS total_rows, COUNT(DISTINCT user_id) AS total_users
+        FROM {seq_table}
+    """).fetchone()
+    total_rows, total_users = total_stats
+    logger.info(f"전체: {total_rows:,} 행, {total_users:,} 유저")
+
+    # 1. 음수/0/양수 분포 (행 및 유저 기준)
+    logger.info(f"\n[1] actual_plan_days 부호별 분포")
+    sign_dist = con.execute(f"""
+        SELECT
+            CASE
+                WHEN actual_plan_days < 0 THEN 'negative'
+                WHEN actual_plan_days = 0 THEN 'zero'
+                ELSE 'positive'
+            END AS sign_category,
+            COUNT(*) AS row_count,
+            COUNT(DISTINCT user_id) AS user_count
+        FROM {seq_table}
+        GROUP BY sign_category
+        ORDER BY
+            CASE sign_category
+                WHEN 'negative' THEN 1
+                WHEN 'zero' THEN 2
+                ELSE 3
+            END
+    """).fetchall()
+
+    sign_categories = []
+    sign_row_counts = []
+    sign_user_counts = []
+    for category, row_cnt, user_cnt in sign_dist:
+        sign_categories.append(category)
+        sign_row_counts.append(row_cnt)
+        sign_user_counts.append(user_cnt)
+        logger.info(f"  {category}: {row_cnt:,} 행 ({row_cnt/total_rows*100:.2f}%), {user_cnt:,} 유저 ({user_cnt/total_users*100:.2f}%)")
+
+    # 부호별 분포 그래프
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    # 행 기준
+    bars1 = axes[0].bar(sign_categories, sign_row_counts, color=['#e74c3c', '#f39c12', '#27ae60'])
+    axes[0].set_title('actual_plan_days Sign Distribution (Rows)')
+    axes[0].set_xlabel('Sign Category')
+    axes[0].set_ylabel('Row Count')
+    axes[0].set_ylim(bottom=0)
+    for bar, cnt in zip(bars1, sign_row_counts):
+        axes[0].text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                     f'{cnt:,}\n({cnt/total_rows*100:.1f}%)',
+                     ha='center', va='bottom', fontsize=9)
+
+    # 유저 기준
+    bars2 = axes[1].bar(sign_categories, sign_user_counts, color=['#e74c3c', '#f39c12', '#27ae60'])
+    axes[1].set_title('actual_plan_days Sign Distribution (Users)')
+    axes[1].set_xlabel('Sign Category')
+    axes[1].set_ylabel('User Count')
+    axes[1].set_ylim(bottom=0)
+    for bar, cnt in zip(bars2, sign_user_counts):
+        axes[1].text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                     f'{cnt:,}\n({cnt/total_users*100:.1f}%)',
+                     ha='center', va='bottom', fontsize=9)
+
+    plt.tight_layout()
+    sign_plot_path = os.path.join(output_dir, "actual_plan_days_sign_distribution.png")
+    plt.savefig(sign_plot_path, dpi=150)
+    plt.close()
+    logger.info(f"  그래프 저장: {sign_plot_path}")
+
+    # 2. 음수/0/양수 분포 (유저 기준 - 해당 카테고리만 가진 유저)
+    logger.info(f"\n[2] actual_plan_days 부호별 분포 (유저 기준 - 해당 부호만 가진 유저)")
+    user_sign_dist = con.execute(f"""
+        WITH user_signs AS (
+            SELECT
+                user_id,
+                SUM(CASE WHEN actual_plan_days < 0 THEN 1 ELSE 0 END) AS neg_cnt,
+                SUM(CASE WHEN actual_plan_days = 0 THEN 1 ELSE 0 END) AS zero_cnt,
+                SUM(CASE WHEN actual_plan_days > 0 THEN 1 ELSE 0 END) AS pos_cnt
+            FROM {seq_table}
+            GROUP BY user_id
+        )
+        SELECT
+            CASE
+                WHEN neg_cnt > 0 AND zero_cnt = 0 AND pos_cnt = 0 THEN 'only_negative'
+                WHEN neg_cnt = 0 AND zero_cnt > 0 AND pos_cnt = 0 THEN 'only_zero'
+                WHEN neg_cnt = 0 AND zero_cnt = 0 AND pos_cnt > 0 THEN 'only_positive'
+                WHEN neg_cnt > 0 AND pos_cnt > 0 THEN 'mixed_neg_pos'
+                WHEN zero_cnt > 0 AND pos_cnt > 0 AND neg_cnt = 0 THEN 'mixed_zero_pos'
+                WHEN neg_cnt > 0 AND zero_cnt > 0 AND pos_cnt = 0 THEN 'mixed_neg_zero'
+                ELSE 'mixed_all'
+            END AS user_category,
+            COUNT(*) AS user_count
+        FROM user_signs
+        GROUP BY user_category
+        ORDER BY user_count DESC
+    """).fetchall()
+
+    user_categories = []
+    user_counts = []
+    for category, user_cnt in user_sign_dist:
+        user_categories.append(category)
+        user_counts.append(user_cnt)
+        logger.info(f"  {category}: {user_cnt:,} 유저 ({user_cnt/total_users*100:.2f}%)")
+
+    # 유저 부호 조합 그래프
+    fig, ax = plt.subplots(figsize=(10, 6))
+    bars = ax.barh(user_categories[::-1], user_counts[::-1], color='#3498db')
+    ax.set_title('User Distribution by actual_plan_days Sign Combination')
+    ax.set_xlabel('User Count')
+    ax.set_ylabel('Category')
+    for bar, cnt in zip(bars, user_counts[::-1]):
+        ax.text(bar.get_width(), bar.get_y() + bar.get_height()/2,
+                f' {cnt:,} ({cnt/total_users*100:.1f}%)',
+                ha='left', va='center', fontsize=9)
+    plt.tight_layout()
+    user_sign_plot_path = os.path.join(output_dir, "actual_plan_days_user_sign_combination.png")
+    plt.savefig(user_sign_plot_path, dpi=150)
+    plt.close()
+    logger.info(f"  그래프 저장: {user_sign_plot_path}")
+
+    # 3. actual_plan_days 값 분포 (구간별) - 행 및 유저 포함
+    logger.info(f"\n[3] actual_plan_days 값 분포 (구간별)")
+    bucket_dist = con.execute(f"""
+        SELECT
+            CASE
+                WHEN actual_plan_days < -30 THEN '< -30'
+                WHEN actual_plan_days < -7 THEN '[-30, -7)'
+                WHEN actual_plan_days < -1 THEN '[-7, -1)'
+                WHEN actual_plan_days < 0 THEN '[-1, 0)'
+                WHEN actual_plan_days = 0 THEN '0'
+                WHEN actual_plan_days <= 7 THEN '(0, 7]'
+                WHEN actual_plan_days <= 30 THEN '(7, 30]'
+                WHEN actual_plan_days <= 31 THEN '(30, 31]'
+                WHEN actual_plan_days <= 60 THEN '(31, 60]'
+                WHEN actual_plan_days <= 90 THEN '(60, 90]'
+                WHEN actual_plan_days <= 180 THEN '(90, 180]'
+                WHEN actual_plan_days <= 365 THEN '(180, 365]'
+                ELSE '> 365'
+            END AS bucket,
+            COUNT(*) AS row_count,
+            COUNT(DISTINCT user_id) AS user_count
+        FROM {seq_table}
+        GROUP BY bucket
+        ORDER BY
+            CASE bucket
+                WHEN '< -30' THEN 1
+                WHEN '[-30, -7)' THEN 2
+                WHEN '[-7, -1)' THEN 3
+                WHEN '[-1, 0)' THEN 4
+                WHEN '0' THEN 5
+                WHEN '(0, 7]' THEN 6
+                WHEN '(7, 30]' THEN 7
+                WHEN '(30, 31]' THEN 8
+                WHEN '(31, 60]' THEN 9
+                WHEN '(60, 90]' THEN 10
+                WHEN '(90, 180]' THEN 11
+                WHEN '(180, 365]' THEN 12
+                ELSE 13
+            END
+    """).fetchall()
+
+    buckets = []
+    bucket_row_counts = []
+    bucket_user_counts = []
+    for bucket, row_cnt, user_cnt in bucket_dist:
+        buckets.append(bucket)
+        bucket_row_counts.append(row_cnt)
+        bucket_user_counts.append(user_cnt)
+        logger.info(f"  {bucket:>12}: {row_cnt:,} 행 ({row_cnt/total_rows*100:.2f}%), {user_cnt:,} 유저 ({user_cnt/total_users*100:.2f}%)")
+
+    # 구간별 분포 그래프
+    fig, axes = plt.subplots(2, 1, figsize=(12, 10))
+
+    # 행 기준
+    colors = ['#e74c3c' if '<' in b or b.startswith('[-') else '#f39c12' if b == '0' else '#27ae60' for b in buckets]
+    bars1 = axes[0].bar(buckets, bucket_row_counts, color=colors)
+    axes[0].set_title('actual_plan_days Bucket Distribution (Rows)')
+    axes[0].set_xlabel('Bucket')
+    axes[0].set_ylabel('Row Count')
+    axes[0].set_ylim(bottom=0)
+    axes[0].tick_params(axis='x', rotation=45)
+    for bar, cnt in zip(bars1, bucket_row_counts):
+        if cnt > 0:
+            axes[0].text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                         f'{cnt:,}\n({cnt/total_rows*100:.1f}%)',
+                         ha='center', va='bottom', fontsize=8)
+
+    # 유저 기준
+    bars2 = axes[1].bar(buckets, bucket_user_counts, color=colors)
+    axes[1].set_title('actual_plan_days Bucket Distribution (Unique Users)')
+    axes[1].set_xlabel('Bucket')
+    axes[1].set_ylabel('User Count')
+    axes[1].set_ylim(bottom=0)
+    axes[1].tick_params(axis='x', rotation=45)
+    for bar, cnt in zip(bars2, bucket_user_counts):
+        if cnt > 0:
+            axes[1].text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                         f'{cnt:,}\n{cnt/total_users*100:.1f}%',
+                         ha='center', va='bottom', fontsize=8)
+
+    plt.tight_layout()
+    bucket_plot_path = os.path.join(output_dir, "actual_plan_days_bucket_distribution.png")
+    plt.savefig(bucket_plot_path, dpi=150)
+    plt.close()
+    logger.info(f"  그래프 저장: {bucket_plot_path}")
+
+    # 4. payment_plan_days vs actual_plan_days 비교
+    logger.info(f"\n[4] payment_plan_days vs actual_plan_days 비교")
+    comparison = con.execute(f"""
+        SELECT
+            CASE
+                WHEN actual_plan_days < payment_plan_days THEN 'actual < payment'
+                WHEN actual_plan_days = payment_plan_days THEN 'actual = payment'
+                ELSE 'actual > payment'
+            END AS comparison,
+            COUNT(*) AS row_count,
+            COUNT(DISTINCT user_id) AS user_count
+        FROM {seq_table}
+        GROUP BY comparison
+        ORDER BY
+            CASE comparison
+                WHEN 'actual < payment' THEN 1
+                WHEN 'actual = payment' THEN 2
+                ELSE 3
+            END
+    """).fetchall()
+
+    comp_labels = []
+    comp_row_counts = []
+    comp_user_counts = []
+    for comp, row_cnt, user_cnt in comparison:
+        comp_labels.append(comp)
+        comp_row_counts.append(row_cnt)
+        comp_user_counts.append(user_cnt)
+        logger.info(f"  {comp}: {row_cnt:,} 행 ({row_cnt/total_rows*100:.2f}%), {user_cnt:,} 유저 ({user_cnt/total_users*100:.2f}%)")
+
+    # payment vs actual 비교 그래프
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    colors = ['#e74c3c', '#3498db', '#27ae60']
+
+    bars1 = axes[0].bar(comp_labels, comp_row_counts, color=colors)
+    axes[0].set_title('payment_plan_days vs actual_plan_days (Rows)')
+    axes[0].set_xlabel('Comparison')
+    axes[0].set_ylabel('Row Count')
+    axes[0].set_ylim(bottom=0)
+    for bar, cnt in zip(bars1, comp_row_counts):
+        axes[0].text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                     f'{cnt:,}\n({cnt/total_rows*100:.1f}%)',
+                     ha='center', va='bottom', fontsize=9)
+
+    bars2 = axes[1].bar(comp_labels, comp_user_counts, color=colors)
+    axes[1].set_title('payment_plan_days vs actual_plan_days (Users)')
+    axes[1].set_xlabel('Comparison')
+    axes[1].set_ylabel('User Count')
+    axes[1].set_ylim(bottom=0)
+    for bar, cnt in zip(bars2, comp_user_counts):
+        axes[1].text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                     f'{cnt:,}\n({cnt/total_users*100:.1f}%)',
+                     ha='center', va='bottom', fontsize=9)
+
+    plt.tight_layout()
+    comp_plot_path = os.path.join(output_dir, "actual_vs_payment_plan_days.png")
+    plt.savefig(comp_plot_path, dpi=150)
+    plt.close()
+    logger.info(f"  그래프 저장: {comp_plot_path}")
+
+    # 5. payment_plan_days별 actual_plan_days 평균
+    logger.info(f"\n[5] payment_plan_days별 actual_plan_days 평균")
+    plan_avg = con.execute(f"""
+        SELECT
+            payment_plan_days,
+            COUNT(*) AS row_count,
+            COUNT(DISTINCT user_id) AS user_count,
+            ROUND(AVG(actual_plan_days), 1) AS avg_actual,
+            ROUND(AVG(actual_plan_days - payment_plan_days), 1) AS avg_diff
+        FROM {seq_table}
+        GROUP BY payment_plan_days
+        ORDER BY row_count DESC
+        LIMIT 10
+    """).fetchall()
+
+    plan_labels = []
+    plan_row_counts = []
+    plan_user_counts = []
+    plan_avg_diffs = []
+    for plan_days, row_cnt, user_cnt, avg_actual, avg_diff in plan_avg:
+        plan_labels.append(str(plan_days))
+        plan_row_counts.append(row_cnt)
+        plan_user_counts.append(user_cnt)
+        plan_avg_diffs.append(avg_diff)
+        logger.info(f"  plan={plan_days}: {row_cnt:,} 행, {user_cnt:,} 유저, avg_actual={avg_actual}, diff={avg_diff:+.1f}")
+
+    # payment_plan_days별 분포 그래프
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    bars1 = axes[0].bar(plan_labels, plan_row_counts, color='#3498db')
+    axes[0].set_title('Transactions by payment_plan_days (Top 10)')
+    axes[0].set_xlabel('payment_plan_days')
+    axes[0].set_ylabel('Row Count')
+    axes[0].set_ylim(bottom=0)
+    axes[0].tick_params(axis='x', rotation=45)
+
+    # 평균 차이 그래프
+    colors = ['#e74c3c' if d < 0 else '#27ae60' for d in plan_avg_diffs]
+    bars2 = axes[1].bar(plan_labels, plan_avg_diffs, color=colors)
+    axes[1].set_title('Avg Difference (actual - payment) by payment_plan_days')
+    axes[1].set_xlabel('payment_plan_days')
+    axes[1].set_ylabel('Avg Difference (days)')
+    axes[1].axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    axes[1].tick_params(axis='x', rotation=45)
+    for bar, diff in zip(bars2, plan_avg_diffs):
+        axes[1].text(bar.get_x() + bar.get_width()/2,
+                     bar.get_height() + (0.5 if diff >= 0 else -1.5),
+                     f'{diff:+.1f}',
+                     ha='center', va='bottom' if diff >= 0 else 'top', fontsize=9)
+
+    plt.tight_layout()
+    plan_plot_path = os.path.join(output_dir, "actual_plan_days_by_payment_plan.png")
+    plt.savefig(plan_plot_path, dpi=150)
+    plt.close()
+    logger.info(f"  그래프 저장: {plan_plot_path}")
+
+    # 6. is_cancel별 actual_plan_days 분포
+    logger.info(f"\n[6] is_cancel별 actual_plan_days 분포")
+    cancel_dist = con.execute(f"""
+        SELECT
+            is_cancel,
+            COUNT(*) AS row_count,
+            COUNT(DISTINCT user_id) AS user_count,
+            SUM(CASE WHEN actual_plan_days < 0 THEN 1 ELSE 0 END) AS neg_cnt,
+            SUM(CASE WHEN actual_plan_days = 0 THEN 1 ELSE 0 END) AS zero_cnt,
+            SUM(CASE WHEN actual_plan_days > 0 THEN 1 ELSE 0 END) AS pos_cnt,
+            ROUND(AVG(actual_plan_days), 1) AS avg_actual
+        FROM {seq_table}
+        GROUP BY is_cancel
+        ORDER BY is_cancel
+    """).fetchall()
+
+    cancel_data = []
+    for is_cancel, row_cnt, user_cnt, neg, zero, pos, avg in cancel_dist:
+        cancel_data.append({
+            'is_cancel': is_cancel,
+            'row_count': row_cnt,
+            'user_count': user_cnt,
+            'neg': neg, 'zero': zero, 'pos': pos,
+            'avg': avg
+        })
+        logger.info(f"  is_cancel={is_cancel}: {row_cnt:,} 행, {user_cnt:,} 유저")
+        logger.info(f"    neg={neg:,} ({neg/row_cnt*100:.1f}%), zero={zero:,} ({zero/row_cnt*100:.1f}%), pos={pos:,} ({pos/row_cnt*100:.1f}%)")
+        logger.info(f"    avg_actual={avg}")
+
+    # is_cancel별 분포 그래프
+    if len(cancel_data) == 2:
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+        # 행 수 비교
+        cancel_labels = [f'is_cancel={d["is_cancel"]}' for d in cancel_data]
+        cancel_rows = [d['row_count'] for d in cancel_data]
+        cancel_users = [d['user_count'] for d in cancel_data]
+
+        axes[0].bar(cancel_labels, cancel_rows, color=['#27ae60', '#e74c3c'])
+        axes[0].set_title('Transactions by is_cancel')
+        axes[0].set_ylabel('Row Count')
+        axes[0].set_ylim(bottom=0)
+
+        # 부호별 비율 (stacked bar)
+        x = range(len(cancel_data))
+        width = 0.6
+        neg_pcts = [d['neg']/d['row_count']*100 for d in cancel_data]
+        zero_pcts = [d['zero']/d['row_count']*100 for d in cancel_data]
+        pos_pcts = [d['pos']/d['row_count']*100 for d in cancel_data]
+
+        axes[1].bar(x, neg_pcts, width, label='negative', color='#e74c3c')
+        axes[1].bar(x, zero_pcts, width, bottom=neg_pcts, label='zero', color='#f39c12')
+        axes[1].bar(x, pos_pcts, width, bottom=[n+z for n, z in zip(neg_pcts, zero_pcts)], label='positive', color='#27ae60')
+        axes[1].set_title('actual_plan_days Sign Distribution by is_cancel')
+        axes[1].set_ylabel('Percentage (%)')
+        axes[1].set_xticks(x)
+        axes[1].set_xticklabels(cancel_labels)
+        axes[1].legend()
+        axes[1].set_ylim(0, 100)
+
+        plt.tight_layout()
+        cancel_plot_path = os.path.join(output_dir, "actual_plan_days_by_is_cancel.png")
+        plt.savefig(cancel_plot_path, dpi=150)
+        plt.close()
+        logger.info(f"  그래프 저장: {cancel_plot_path}")
+
+    # 7. 음수 actual_plan_days 상세 분석
+    neg_count = con.execute(f"SELECT COUNT(*) FROM {seq_table} WHERE actual_plan_days < 0").fetchone()[0]
+    if neg_count > 0:
+        logger.info(f"\n[7] 음수 actual_plan_days 상세 분석 (상위 10개 패턴)")
+        neg_patterns = con.execute(f"""
+            SELECT
+                payment_plan_days,
+                actual_plan_days,
+                is_cancel,
+                COUNT(*) AS cnt,
+                COUNT(DISTINCT user_id) AS user_cnt
+            FROM {seq_table}
+            WHERE actual_plan_days < 0
+            GROUP BY payment_plan_days, actual_plan_days, is_cancel
+            ORDER BY cnt DESC
+            LIMIT 10
+        """).fetchall()
+
+        for plan, actual, cancel, cnt, user_cnt in neg_patterns:
+            logger.info(f"  plan={plan}, actual={actual}, is_cancel={cancel}: {cnt:,} 행, {user_cnt:,} 유저")
+
+    con.close()
+    logger.info(f"\n=== actual_plan_days 분석 완료 ===\n")
+
+
+# ============================================================================
+# 8.5.2.1. is_cancel=1 트랜잭션의 actual_plan_days 분포 분석
+# ============================================================================
+def analyze_cancel_actual_plan_days(
+    db_path: str,
+    seq_table: str = "transactions_seq",
+    output_dir: str = "data/analysis",
+) -> None:
+    """
+    is_cancel=1인 트랜잭션의 actual_plan_days 분포를 분석합니다.
+
+    Args:
+        db_path: DuckDB 데이터베이스 경로
+        seq_table: 트랜잭션 시퀀스 테이블명 (기본값: transactions_seq)
+        output_dir: 그래프 저장 디렉토리 (기본값: data/analysis)
+    """
+    import matplotlib.pyplot as plt
+
+    logger.info(f"=== is_cancel=1 actual_plan_days 분석 시작 ===")
+    logger.info(f"테이블: {seq_table}")
+    logger.info(f"출력 디렉토리: {output_dir}")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    con = duckdb.connect(db_path)
+    con.execute("PRAGMA threads=8;")
+
+    # 테이블 존재 확인
+    existing_tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
+    if seq_table not in existing_tables:
+        logger.error(f"테이블 {seq_table}이 존재하지 않습니다.")
+        con.close()
+        return
+
+    # 전체 및 is_cancel=1 통계
+    total_stats = con.execute(f"""
+        SELECT
+            COUNT(*) AS total_rows,
+            SUM(CASE WHEN is_cancel = 1 THEN 1 ELSE 0 END) AS cancel_rows,
+            COUNT(DISTINCT user_id) AS total_users,
+            COUNT(DISTINCT CASE WHEN is_cancel = 1 THEN user_id END) AS cancel_users
+        FROM {seq_table}
+    """).fetchone()
+    total_rows, cancel_rows, total_users, cancel_users = total_stats
+    logger.info(f"전체: {total_rows:,} 행, {total_users:,} 유저")
+    logger.info(f"is_cancel=1: {cancel_rows:,} 행 ({cancel_rows/total_rows*100:.2f}%), {cancel_users:,} 유저 ({cancel_users/total_users*100:.2f}%)")
+
+    if cancel_rows == 0:
+        logger.info("is_cancel=1인 트랜잭션이 없습니다.")
+        con.close()
+        logger.info(f"=== is_cancel=1 actual_plan_days 분석 완료 ===\n")
+        return
+
+    # 1. 부호별 분포
+    logger.info(f"\n[1] is_cancel=1 actual_plan_days 부호별 분포")
+    sign_dist = con.execute(f"""
+        SELECT
+            CASE
+                WHEN actual_plan_days < 0 THEN 'negative'
+                WHEN actual_plan_days = 0 THEN 'zero'
+                ELSE 'positive'
+            END AS sign_category,
+            COUNT(*) AS row_count,
+            COUNT(DISTINCT user_id) AS user_count
+        FROM {seq_table}
+        WHERE is_cancel = 1
+        GROUP BY sign_category
+        ORDER BY
+            CASE sign_category
+                WHEN 'negative' THEN 1
+                WHEN 'zero' THEN 2
+                ELSE 3
+            END
+    """).fetchall()
+
+    sign_categories = []
+    sign_row_counts = []
+    sign_user_counts = []
+    for category, row_cnt, user_cnt in sign_dist:
+        sign_categories.append(category)
+        sign_row_counts.append(row_cnt)
+        sign_user_counts.append(user_cnt)
+        logger.info(f"  {category}: {row_cnt:,} 행 ({row_cnt/cancel_rows*100:.2f}%), {user_cnt:,} 유저 ({user_cnt/cancel_users*100:.2f}%)")
+
+    # 2. 구간별 분포
+    logger.info(f"\n[2] is_cancel=1 actual_plan_days 구간별 분포")
+    bucket_dist = con.execute(f"""
+        SELECT
+            CASE
+                WHEN actual_plan_days < -31 THEN '< -31'
+                WHEN actual_plan_days < -30 THEN '[-31, -30)'
+                WHEN actual_plan_days < -7 THEN '[-30, -7)'
+                WHEN actual_plan_days < -1 THEN '[-7, -1)'
+                WHEN actual_plan_days < 0 THEN '[-1, 0)'
+                WHEN actual_plan_days = 0 THEN '0'
+                WHEN actual_plan_days <= 7 THEN '(0, 7]'
+                WHEN actual_plan_days <= 30 THEN '(7, 30]'
+                WHEN actual_plan_days <= 31 THEN '(30, 31]'
+                WHEN actual_plan_days <= 90 THEN '(31, 90]'
+                WHEN actual_plan_days <= 180 THEN '(90, 180]'
+                WHEN actual_plan_days <= 365 THEN '(180, 365]'
+                ELSE '> 365'
+            END AS bucket,
+            COUNT(*) AS row_count,
+            COUNT(DISTINCT user_id) AS user_count
+        FROM {seq_table}
+        WHERE is_cancel = 1
+        GROUP BY bucket
+        ORDER BY
+            CASE bucket
+                WHEN '< -31' THEN 1
+                WHEN '[-31, -30)' THEN 2
+                WHEN '[-30, -7)' THEN 3
+                WHEN '[-7, -1)' THEN 4
+                WHEN '[-1, 0)' THEN 5
+                WHEN '0' THEN 6
+                WHEN '(0, 7]' THEN 7
+                WHEN '(7, 30]' THEN 8
+                WHEN '(30, 31]' THEN 9
+                WHEN '(31, 90]' THEN 10
+                WHEN '(90, 180]' THEN 11
+                WHEN '(180, 365]' THEN 12
+                ELSE 13
+            END
+    """).fetchall()
+
+    buckets = []
+    bucket_row_counts = []
+    bucket_user_counts = []
+    for bucket, row_cnt, user_cnt in bucket_dist:
+        buckets.append(bucket)
+        bucket_row_counts.append(row_cnt)
+        bucket_user_counts.append(user_cnt)
+        logger.info(f"  {bucket:>15}: {row_cnt:,} 행 ({row_cnt/cancel_rows*100:.2f}%), {user_cnt:,} 유저 ({user_cnt/cancel_users*100:.2f}%)")
+
+    # 3. 통계 요약
+    logger.info(f"\n[3] is_cancel=1 actual_plan_days 통계 요약")
+    stats = con.execute(f"""
+        SELECT
+            MIN(actual_plan_days) AS min_val,
+            MAX(actual_plan_days) AS max_val,
+            ROUND(AVG(actual_plan_days), 1) AS avg_val,
+            ROUND(MEDIAN(actual_plan_days), 1) AS median_val,
+            ROUND(STDDEV(actual_plan_days), 1) AS std_val
+        FROM {seq_table}
+        WHERE is_cancel = 1
+    """).fetchone()
+    logger.info(f"  min={stats[0]}, max={stats[1]}, avg={stats[2]}, median={stats[3]}, std={stats[4]}")
+
+    # 4. payment_plan_days별 분포
+    logger.info(f"\n[4] is_cancel=1 payment_plan_days별 actual_plan_days 통계")
+    plan_stats = con.execute(f"""
+        SELECT
+            payment_plan_days,
+            COUNT(*) AS row_count,
+            COUNT(DISTINCT user_id) AS user_count,
+            ROUND(AVG(actual_plan_days), 1) AS avg_actual,
+            ROUND(MEDIAN(actual_plan_days), 1) AS median_actual,
+            MIN(actual_plan_days) AS min_actual,
+            MAX(actual_plan_days) AS max_actual
+        FROM {seq_table}
+        WHERE is_cancel = 1
+        GROUP BY payment_plan_days
+        ORDER BY row_count DESC
+        LIMIT 10
+    """).fetchall()
+
+    for plan, row_cnt, user_cnt, avg_val, med_val, min_val, max_val in plan_stats:
+        logger.info(f"  plan={plan}: {row_cnt:,} 행, {user_cnt:,} 유저, avg={avg_val}, median={med_val}, range=[{min_val}, {max_val}]")
+
+    # 그래프 생성
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # 부호별 분포 (행)
+    colors_sign = ['#e74c3c' if c == 'negative' else '#f39c12' if c == 'zero' else '#27ae60' for c in sign_categories]
+    bars1 = axes[0, 0].bar(sign_categories, sign_row_counts, color=colors_sign)
+    axes[0, 0].set_title('is_cancel=1: Sign Distribution (Rows)')
+    axes[0, 0].set_ylabel('Row Count')
+    axes[0, 0].set_ylim(bottom=0)
+    for bar, cnt in zip(bars1, sign_row_counts):
+        axes[0, 0].text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                        f'{cnt:,}\n({cnt/cancel_rows*100:.1f}%)',
+                        ha='center', va='bottom', fontsize=9)
+
+    # 부호별 분포 (유저)
+    bars2 = axes[0, 1].bar(sign_categories, sign_user_counts, color=colors_sign)
+    axes[0, 1].set_title('is_cancel=1: Sign Distribution (Users)')
+    axes[0, 1].set_ylabel('User Count')
+    axes[0, 1].set_ylim(bottom=0)
+    for bar, cnt in zip(bars2, sign_user_counts):
+        axes[0, 1].text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                        f'{cnt:,}\n({cnt/cancel_users*100:.1f}%)',
+                        ha='center', va='bottom', fontsize=9)
+
+    # 구간별 분포 (행)
+    colors_bucket = ['#e74c3c' if '<' in b or b.startswith('[-') or b.startswith('[') else '#f39c12' if b == '0' else '#27ae60' for b in buckets]
+    bars3 = axes[1, 0].bar(range(len(buckets)), bucket_row_counts, color=colors_bucket)
+    axes[1, 0].set_title('is_cancel=1: Bucket Distribution (Rows)')
+    axes[1, 0].set_ylabel('Row Count')
+    axes[1, 0].set_xticks(range(len(buckets)))
+    axes[1, 0].set_xticklabels(buckets, rotation=45, ha='right')
+    axes[1, 0].set_ylim(bottom=0)
+
+    # 구간별 분포 (유저)
+    bars4 = axes[1, 1].bar(range(len(buckets)), bucket_user_counts, color=colors_bucket)
+    axes[1, 1].set_title('is_cancel=1: Bucket Distribution (Users)')
+    axes[1, 1].set_ylabel('User Count')
+    axes[1, 1].set_xticks(range(len(buckets)))
+    axes[1, 1].set_xticklabels(buckets, rotation=45, ha='right')
+    axes[1, 1].set_ylim(bottom=0)
+
+    plt.tight_layout()
+    plot_path = os.path.join(output_dir, "cancel_actual_plan_days_distribution.png")
+    plt.savefig(plot_path, dpi=150)
+    plt.close()
+    logger.info(f"\n그래프 저장: {plot_path}")
+
+    con.close()
+    logger.info(f"=== is_cancel=1 actual_plan_days 분석 완료 ===\n")
+
+
+# ============================================================================
+# 8.5.3. actual_plan_days 범위 밖 유저 제외
+# ============================================================================
+def exclude_out_of_range_actual_plan_days_users(
+    db_path: str,
+    seq_table: str = "transactions_seq",
+    target_tables: list[str] = None,
+    non_cancel_min: int = 1,
+    non_cancel_max: int = 410,
+    cancel_min: int = -31,
+    cancel_max: int = 410,
+) -> None:
+    """
+    actual_plan_days가 지정된 범위를 벗어나는 트랜잭션을 가진 유저를 모든 _merge 테이블에서 제외합니다.
+
+    is_cancel 여부에 따라 다른 범위를 적용합니다:
+    - is_cancel=0: [non_cancel_min, non_cancel_max] 범위 적용
+    - is_cancel=1: [cancel_min, cancel_max] 범위 적용
+
+    Args:
+        db_path: DuckDB 데이터베이스 경로
+        seq_table: 트랜잭션 시퀀스 테이블명 (기본값: transactions_seq)
+        target_tables: 필터링을 적용할 대상 테이블 이름 리스트
+                       기본값: ["train_merge", "transactions_merge", "user_logs_merge", "members_merge"]
+        non_cancel_min: is_cancel=0일 때 최소 actual_plan_days (포함, 기본값: 1)
+        non_cancel_max: is_cancel=0일 때 최대 actual_plan_days (포함, 기본값: 410)
+        cancel_min: is_cancel=1일 때 최소 actual_plan_days (포함, 기본값: -31)
+        cancel_max: is_cancel=1일 때 최대 actual_plan_days (포함, 기본값: 410)
+    """
+    if target_tables is None:
+        target_tables = ["train_merge", "transactions_merge", "user_logs_merge", "members_merge"]
+
+    logger.info(f"=== actual_plan_days 범위 밖 유저 제외 시작 ===")
+    logger.info(f"시퀀스 테이블: {seq_table}")
+    logger.info(f"is_cancel=0 범위: [{non_cancel_min}, {non_cancel_max}]")
+    logger.info(f"is_cancel=1 범위: [{cancel_min}, {cancel_max}]")
+    logger.info(f"대상 테이블: {target_tables}")
+
+    con = duckdb.connect(db_path)
+    con.execute("PRAGMA threads=8;")
+
+    existing_tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
+
+    # 시퀀스 테이블 존재 확인
+    if seq_table not in existing_tables:
+        logger.error(f"{seq_table} 테이블이 존재하지 않습니다.")
+        con.close()
+        return
+
+    # 시퀀스 테이블의 user_id 컬럼 확인
+    seq_cols = [row[0] for row in con.execute(f"DESCRIBE {seq_table}").fetchall()]
+    if "user_id" in seq_cols:
+        id_col = "user_id"
+    elif "msno" in seq_cols:
+        id_col = "msno"
+    else:
+        logger.error(f"{seq_table}에 user_id/msno 컬럼이 없습니다.")
+        con.close()
+        return
+
+    # 전체 유저 수
+    total_users = con.execute(f"""
+        SELECT COUNT(DISTINCT {id_col}) FROM {seq_table}
+    """).fetchone()[0]
+    logger.info(f"시퀀스 테이블 전체 유저 수: {total_users:,}")
+
+    # 범위 밖 actual_plan_days를 가진 유저 추출 (is_cancel별 다른 조건)
+    con.execute(f"""
+        CREATE OR REPLACE TABLE _out_of_range_actual_plan_users_temp AS
+        SELECT DISTINCT {id_col}
+        FROM {seq_table}
+        WHERE
+            -- is_cancel=0: [{non_cancel_min}, {non_cancel_max}] 범위 밖
+            (is_cancel = 0 AND (actual_plan_days < {non_cancel_min} OR actual_plan_days > {non_cancel_max}))
+            OR
+            -- is_cancel=1: [{cancel_min}, {cancel_max}] 범위 밖
+            (is_cancel = 1 AND (actual_plan_days < {cancel_min} OR actual_plan_days > {cancel_max}));
+    """)
+
+    out_of_range_count = con.execute("SELECT COUNT(*) FROM _out_of_range_actual_plan_users_temp").fetchone()[0]
+    logger.info(f"범위 밖 유저 수: {out_of_range_count:,} ({out_of_range_count/total_users*100:.2f}%)")
+
+    # 범위 밖 상세 통계 (is_cancel별)
+    out_of_range_stats = con.execute(f"""
+        SELECT
+            is_cancel,
+            SUM(CASE WHEN is_cancel = 0 AND actual_plan_days < {non_cancel_min} THEN 1
+                     WHEN is_cancel = 1 AND actual_plan_days < {cancel_min} THEN 1
+                     ELSE 0 END) AS below_min,
+            SUM(CASE WHEN is_cancel = 0 AND actual_plan_days > {non_cancel_max} THEN 1
+                     WHEN is_cancel = 1 AND actual_plan_days > {cancel_max} THEN 1
+                     ELSE 0 END) AS above_max,
+            COUNT(*) AS total_out
+        FROM {seq_table}
+        WHERE
+            (is_cancel = 0 AND (actual_plan_days < {non_cancel_min} OR actual_plan_days > {non_cancel_max}))
+            OR
+            (is_cancel = 1 AND (actual_plan_days < {cancel_min} OR actual_plan_days > {cancel_max}))
+        GROUP BY is_cancel
+        ORDER BY is_cancel
+    """).fetchall()
+
+    for is_cancel, below, above, total in out_of_range_stats:
+        if is_cancel == 0:
+            logger.info(f"  is_cancel=0: {total:,} 행 (< {non_cancel_min}: {below:,}, > {non_cancel_max}: {above:,})")
+        else:
+            logger.info(f"  is_cancel=1: {total:,} 행 (< {cancel_min}: {below:,}, > {cancel_max}: {above:,})")
+
+    if out_of_range_count == 0:
+        logger.info("제외할 유저가 없습니다.")
+        con.execute("DROP TABLE IF EXISTS _out_of_range_actual_plan_users_temp;")
+        con.close()
+        return
+
+    # 대상 테이블에서 범위 밖 유저 제외
+    for t in tqdm(target_tables, desc="actual_plan_days 범위 밖 유저 제외"):
+        if t not in existing_tables:
+            logger.warning(f"  {t}: 존재하지 않음, 건너뜀")
+            continue
+
+        # 대상 테이블의 user_id 컬럼 확인
+        target_cols = [row[0] for row in con.execute(f"DESCRIBE {t}").fetchall()]
+        if "user_id" in target_cols:
+            target_col = "user_id"
+        elif "msno" in target_cols:
+            target_col = "msno"
+        else:
+            logger.warning(f"  {t}: user_id/msno 컬럼 없음, 건너뜀")
+            continue
+
+        logger.info(f"  {t} 필터링 중...")
+
+        # 필터링 전 통계
+        before_rows = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+        before_unique = con.execute(f"SELECT COUNT(DISTINCT {target_col}) FROM {t}").fetchone()[0]
+
+        # 범위 밖 유저 제외 (NOT IN)
+        con.execute(f"""
+            CREATE OR REPLACE TABLE {t}_filtered AS
+            SELECT *
+            FROM {t}
+            WHERE {target_col} NOT IN (SELECT {id_col} FROM _out_of_range_actual_plan_users_temp);
+        """)
+
+        # 원본 테이블 교체
+        con.execute(f"DROP TABLE {t};")
+        con.execute(f"ALTER TABLE {t}_filtered RENAME TO {t};")
+
+        # 필터링 후 통계
+        after_rows = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+        after_unique = con.execute(f"SELECT COUNT(DISTINCT {target_col}) FROM {t}").fetchone()[0]
+
+        rows_removed = before_rows - after_rows
+        users_removed = before_unique - after_unique
+
+        logger.info(f"    {before_rows:,} -> {after_rows:,} 행 ({rows_removed:,} 제거)")
+        logger.info(f"    {before_unique:,} -> {after_unique:,} 고유 유저 ({users_removed:,} 제거)")
+
+    # 임시 테이블 삭제
+    con.execute("DROP TABLE IF EXISTS _out_of_range_actual_plan_users_temp;")
+
+    con.close()
+    logger.info(f"=== actual_plan_days 범위 밖 유저 제외 완료 ===\n")
+
+
+# ============================================================================
+# 8.5.3.1. plan_days_diff 컬럼 추가
+# ============================================================================
+def add_plan_days_diff(
+    db_path: str,
+    seq_table: str = "transactions_seq",
+) -> None:
+    """
+    transactions_seq 테이블에 plan_days_diff 컬럼을 추가합니다.
+
+    plan_days_diff = payment_plan_days - actual_plan_days
+    - 양수: 결제한 플랜보다 실제 연장 기간이 짧음 (손해)
+    - 0: 결제한 플랜과 실제 연장 기간이 동일
+    - 음수: 결제한 플랜보다 실제 연장 기간이 김 (이득)
+
+    Args:
+        db_path: DuckDB 데이터베이스 경로
+        seq_table: 트랜잭션 시퀀스 테이블명 (기본값: transactions_seq)
+    """
+    logger.info(f"=== {seq_table}에 plan_days_diff 추가 시작 ===")
+
+    con = duckdb.connect(db_path)
+    con.execute("PRAGMA threads=8;")
+
+    # 테이블 존재 확인
+    existing_tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
+    if seq_table not in existing_tables:
+        logger.error(f"테이블 {seq_table}이 존재하지 않습니다.")
+        con.close()
+        return
+
+    # 이미 컬럼이 존재하는지 확인
+    columns = [row[0] for row in con.execute(f"DESCRIBE {seq_table}").fetchall()]
+    if "plan_days_diff" in columns:
+        logger.info("plan_days_diff 컬럼이 이미 존재합니다. 재계산합니다.")
+        con.execute(f"ALTER TABLE {seq_table} DROP COLUMN plan_days_diff")
+
+    # plan_days_diff 컬럼 추가
+    logger.info("plan_days_diff 계산 중...")
+    con.execute(f"""
+        ALTER TABLE {seq_table}
+        ADD COLUMN plan_days_diff BIGINT;
+    """)
+
+    con.execute(f"""
+        UPDATE {seq_table}
+        SET plan_days_diff = payment_plan_days - actual_plan_days;
+    """)
+
+    # 결과 통계
+    stats = con.execute(f"""
+        SELECT
+            COUNT(*) AS total_rows,
+            SUM(CASE WHEN plan_days_diff > 0 THEN 1 ELSE 0 END) AS positive_cnt,
+            SUM(CASE WHEN plan_days_diff = 0 THEN 1 ELSE 0 END) AS zero_cnt,
+            SUM(CASE WHEN plan_days_diff < 0 THEN 1 ELSE 0 END) AS negative_cnt,
+            ROUND(AVG(plan_days_diff), 2) AS avg_diff,
+            MIN(plan_days_diff) AS min_diff,
+            MAX(plan_days_diff) AS max_diff
+        FROM {seq_table}
+    """).fetchone()
+
+    total, pos, zero, neg, avg, min_val, max_val = stats
+    logger.info(f"추가 완료: {total:,} 행")
+    logger.info(f"plan_days_diff 통계:")
+    logger.info(f"  양수 (payment > actual): {pos:,} ({pos/total*100:.2f}%)")
+    logger.info(f"  0 (payment = actual): {zero:,} ({zero/total*100:.2f}%)")
+    logger.info(f"  음수 (payment < actual): {neg:,} ({neg/total*100:.2f}%)")
+    logger.info(f"  평균: {avg}, 범위: [{min_val}, {max_val}]")
+
+    # is_cancel별 통계
+    cancel_stats = con.execute(f"""
+        SELECT
+            is_cancel,
+            COUNT(*) AS cnt,
+            ROUND(AVG(plan_days_diff), 2) AS avg_diff,
+            MIN(plan_days_diff) AS min_diff,
+            MAX(plan_days_diff) AS max_diff
+        FROM {seq_table}
+        GROUP BY is_cancel
+        ORDER BY is_cancel
+    """).fetchall()
+
+    logger.info(f"is_cancel별 통계:")
+    for is_cancel, cnt, avg, min_val, max_val in cancel_stats:
+        logger.info(f"  is_cancel={is_cancel}: {cnt:,} 행, avg={avg}, range=[{min_val}, {max_val}]")
+
+    con.close()
+    logger.info(f"=== {seq_table}에 plan_days_diff 추가 완료 ===\n")
+
+
+# ============================================================================
+# 8.5.3.2. is_cancel 트랜잭션의 actual_plan_days 분포 분석
+# ============================================================================
+def analyze_cancel_actual_plan_days_distribution(
+    db_path: str,
+    seq_table: str = "transactions_seq",
+    output_dir: str = "data/analysis",
+) -> None:
+    """
+    is_cancel=1인 트랜잭션의 actual_plan_days 분포를 상세 분석합니다.
+
+    Args:
+        db_path: DuckDB 데이터베이스 경로
+        seq_table: 트랜잭션 시퀀스 테이블명 (기본값: transactions_seq)
+        output_dir: 그래프 저장 디렉토리 (기본값: data/analysis)
+    """
+    import matplotlib.pyplot as plt
+
+    logger.info(f"=== is_cancel 트랜잭션 actual_plan_days 분포 분석 시작 ===")
+    logger.info(f"테이블: {seq_table}")
+    logger.info(f"출력 디렉토리: {output_dir}")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    con = duckdb.connect(db_path)
+    con.execute("PRAGMA threads=8;")
+
+    # 테이블 존재 확인
+    existing_tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
+    if seq_table not in existing_tables:
+        logger.error(f"테이블 {seq_table}이 존재하지 않습니다.")
+        con.close()
+        return
+
+    # 전체 및 is_cancel=1 통계
+    total_stats = con.execute(f"""
+        SELECT
+            COUNT(*) AS total_rows,
+            SUM(CASE WHEN is_cancel = 1 THEN 1 ELSE 0 END) AS cancel_rows,
+            COUNT(DISTINCT user_id) AS total_users,
+            COUNT(DISTINCT CASE WHEN is_cancel = 1 THEN user_id END) AS cancel_users
+        FROM {seq_table}
+    """).fetchone()
+    total_rows, cancel_rows, total_users, cancel_users = total_stats
+    logger.info(f"전체: {total_rows:,} 행, {total_users:,} 유저")
+    logger.info(f"is_cancel=1: {cancel_rows:,} 행 ({cancel_rows/total_rows*100:.2f}%), {cancel_users:,} 유저 ({cancel_users/total_users*100:.2f}%)")
+
+    if cancel_rows == 0:
+        logger.info("is_cancel=1인 트랜잭션이 없습니다.")
+        con.close()
+        logger.info(f"=== is_cancel 트랜잭션 actual_plan_days 분포 분석 완료 ===\n")
+        return
+
+    # 1. 기본 통계
+    logger.info(f"\n[1] is_cancel=1 actual_plan_days 기본 통계")
+    basic_stats = con.execute(f"""
+        SELECT
+            MIN(actual_plan_days) AS min_val,
+            MAX(actual_plan_days) AS max_val,
+            ROUND(AVG(actual_plan_days), 2) AS avg_val,
+            ROUND(MEDIAN(actual_plan_days), 2) AS median_val,
+            ROUND(STDDEV(actual_plan_days), 2) AS std_val,
+            MODE(actual_plan_days) AS mode_val
+        FROM {seq_table}
+        WHERE is_cancel = 1
+    """).fetchone()
+    logger.info(f"  min={basic_stats[0]}, max={basic_stats[1]}")
+    logger.info(f"  avg={basic_stats[2]}, median={basic_stats[3]}, std={basic_stats[4]}")
+    logger.info(f"  mode={basic_stats[5]}")
+
+    # 2. 값별 분포 (상위 20개)
+    logger.info(f"\n[2] is_cancel=1 actual_plan_days 값별 분포 (상위 20개)")
+    value_dist = con.execute(f"""
+        SELECT
+            actual_plan_days,
+            COUNT(*) AS row_count,
+            COUNT(DISTINCT user_id) AS user_count
+        FROM {seq_table}
+        WHERE is_cancel = 1
+        GROUP BY actual_plan_days
+        ORDER BY row_count DESC
+        LIMIT 20
+    """).fetchall()
+
+    values = []
+    value_row_counts = []
+    value_user_counts = []
+    for val, row_cnt, user_cnt in value_dist:
+        values.append(val)
+        value_row_counts.append(row_cnt)
+        value_user_counts.append(user_cnt)
+        logger.info(f"  {val}: {row_cnt:,} 행 ({row_cnt/cancel_rows*100:.2f}%), {user_cnt:,} 유저")
+
+    # 3. 구간별 분포
+    logger.info(f"\n[3] is_cancel=1 actual_plan_days 구간별 분포")
+    bucket_dist = con.execute(f"""
+        SELECT
+            CASE
+                WHEN actual_plan_days < -365 THEN '< -365'
+                WHEN actual_plan_days < -180 THEN '[-365, -180)'
+                WHEN actual_plan_days < -90 THEN '[-180, -90)'
+                WHEN actual_plan_days < -31 THEN '[-90, -31)'
+                WHEN actual_plan_days < 0 THEN '[-31, 0)'
+                WHEN actual_plan_days = 0 THEN '0'
+                WHEN actual_plan_days <= 30 THEN '(0, 30]'
+                WHEN actual_plan_days <= 90 THEN '(30, 90]'
+                WHEN actual_plan_days <= 180 THEN '(90, 180]'
+                WHEN actual_plan_days <= 365 THEN '(180, 365]'
+                ELSE '> 365'
+            END AS bucket,
+            COUNT(*) AS row_count,
+            COUNT(DISTINCT user_id) AS user_count
+        FROM {seq_table}
+        WHERE is_cancel = 1
+        GROUP BY bucket
+        ORDER BY
+            CASE bucket
+                WHEN '< -365' THEN 1
+                WHEN '[-365, -180)' THEN 2
+                WHEN '[-180, -90)' THEN 3
+                WHEN '[-90, -31)' THEN 4
+                WHEN '[-31, 0)' THEN 5
+                WHEN '0' THEN 6
+                WHEN '(0, 30]' THEN 7
+                WHEN '(30, 90]' THEN 8
+                WHEN '(90, 180]' THEN 9
+                WHEN '(180, 365]' THEN 10
+                ELSE 11
+            END
+    """).fetchall()
+
+    buckets = []
+    bucket_row_counts = []
+    bucket_user_counts = []
+    for bucket, row_cnt, user_cnt in bucket_dist:
+        buckets.append(bucket)
+        bucket_row_counts.append(row_cnt)
+        bucket_user_counts.append(user_cnt)
+        logger.info(f"  {bucket:>15}: {row_cnt:,} 행 ({row_cnt/cancel_rows*100:.2f}%), {user_cnt:,} 유저 ({user_cnt/cancel_users*100:.2f}%)")
+
+    # 4. payment_plan_days별 분포
+    logger.info(f"\n[4] is_cancel=1 payment_plan_days별 actual_plan_days 통계")
+    plan_stats = con.execute(f"""
+        SELECT
+            payment_plan_days,
+            COUNT(*) AS row_count,
+            ROUND(AVG(actual_plan_days), 2) AS avg_actual,
+            ROUND(MEDIAN(actual_plan_days), 2) AS median_actual,
+            MIN(actual_plan_days) AS min_actual,
+            MAX(actual_plan_days) AS max_actual
+        FROM {seq_table}
+        WHERE is_cancel = 1
+        GROUP BY payment_plan_days
+        ORDER BY row_count DESC
+        LIMIT 10
+    """).fetchall()
+
+    plan_labels = []
+    plan_counts = []
+    plan_avgs = []
+    for plan, cnt, avg, med, min_val, max_val in plan_stats:
+        plan_labels.append(str(plan))
+        plan_counts.append(cnt)
+        plan_avgs.append(avg if avg else 0)
+        logger.info(f"  plan={plan}: {cnt:,} 행, avg={avg}, median={med}, range=[{min_val}, {max_val}]")
+
+    # 그래프 생성
+    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+
+    # 1. 상위 값 분포 (행)
+    top_n = min(15, len(values))
+    colors_val = ['#e74c3c' if v < 0 else '#f39c12' if v == 0 else '#27ae60' for v in values[:top_n]]
+    axes[0, 0].bar([str(v) for v in values[:top_n]], value_row_counts[:top_n], color=colors_val)
+    axes[0, 0].set_title(f'is_cancel=1: Top {top_n} actual_plan_days Values (Rows)')
+    axes[0, 0].set_xlabel('actual_plan_days')
+    axes[0, 0].set_ylabel('Row Count')
+    axes[0, 0].tick_params(axis='x', rotation=45)
+    axes[0, 0].set_ylim(bottom=0)
+
+    # 2. 상위 값 분포 (유저)
+    axes[0, 1].bar([str(v) for v in values[:top_n]], value_user_counts[:top_n], color=colors_val)
+    axes[0, 1].set_title(f'is_cancel=1: Top {top_n} actual_plan_days Values (Users)')
+    axes[0, 1].set_xlabel('actual_plan_days')
+    axes[0, 1].set_ylabel('User Count')
+    axes[0, 1].tick_params(axis='x', rotation=45)
+    axes[0, 1].set_ylim(bottom=0)
+
+    # 3. 구간별 분포 (행)
+    colors_bucket = ['#e74c3c' if '<' in b or b.startswith('[-') else '#f39c12' if b == '0' else '#27ae60' for b in buckets]
+    axes[1, 0].bar(range(len(buckets)), bucket_row_counts, color=colors_bucket)
+    axes[1, 0].set_title('is_cancel=1: Bucket Distribution (Rows)')
+    axes[1, 0].set_xlabel('Bucket')
+    axes[1, 0].set_ylabel('Row Count')
+    axes[1, 0].set_xticks(range(len(buckets)))
+    axes[1, 0].set_xticklabels(buckets, rotation=45, ha='right')
+    axes[1, 0].set_ylim(bottom=0)
+    for i, (cnt, bucket) in enumerate(zip(bucket_row_counts, buckets)):
+        if cnt > 0:
+            axes[1, 0].text(i, cnt, f'{cnt/cancel_rows*100:.1f}%', ha='center', va='bottom', fontsize=8)
+
+    # 4. 구간별 분포 (유저)
+    axes[1, 1].bar(range(len(buckets)), bucket_user_counts, color=colors_bucket)
+    axes[1, 1].set_title('is_cancel=1: Bucket Distribution (Users)')
+    axes[1, 1].set_xlabel('Bucket')
+    axes[1, 1].set_ylabel('User Count')
+    axes[1, 1].set_xticks(range(len(buckets)))
+    axes[1, 1].set_xticklabels(buckets, rotation=45, ha='right')
+    axes[1, 1].set_ylim(bottom=0)
+    for i, (cnt, bucket) in enumerate(zip(bucket_user_counts, buckets)):
+        if cnt > 0:
+            axes[1, 1].text(i, cnt, f'{cnt/cancel_users*100:.1f}%', ha='center', va='bottom', fontsize=8)
+
+    plt.tight_layout()
+    plot_path = os.path.join(output_dir, "cancel_actual_plan_days_detailed_distribution.png")
+    plt.savefig(plot_path, dpi=150)
+    plt.close()
+    logger.info(f"\n그래프 저장: {plot_path}")
+
+    # 히스토그램 (실제 분포)
+    cancel_data = con.execute(f"""
+        SELECT actual_plan_days FROM {seq_table} WHERE is_cancel = 1
+    """).fetchdf()
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # 전체 범위 히스토그램
+    axes[0].hist(cancel_data['actual_plan_days'], bins=50, color='#3498db', edgecolor='black', alpha=0.7)
+    axes[0].set_title('is_cancel=1: actual_plan_days Histogram (Full Range)')
+    axes[0].set_xlabel('actual_plan_days')
+    axes[0].set_ylabel('Frequency')
+    axes[0].axvline(x=0, color='red', linestyle='--', label='0')
+    axes[0].legend()
+
+    # -50 ~ 50 범위 히스토그램 (상세)
+    filtered = cancel_data[(cancel_data['actual_plan_days'] >= -50) & (cancel_data['actual_plan_days'] <= 50)]
+    axes[1].hist(filtered['actual_plan_days'], bins=50, color='#9b59b6', edgecolor='black', alpha=0.7)
+    axes[1].set_title('is_cancel=1: actual_plan_days Histogram ([-50, 50] Range)')
+    axes[1].set_xlabel('actual_plan_days')
+    axes[1].set_ylabel('Frequency')
+    axes[1].axvline(x=0, color='red', linestyle='--', label='0')
+    axes[1].legend()
+
+    plt.tight_layout()
+    hist_path = os.path.join(output_dir, "cancel_actual_plan_days_histogram.png")
+    plt.savefig(hist_path, dpi=150)
+    plt.close()
+    logger.info(f"그래프 저장: {hist_path}")
+
+    con.close()
+    logger.info(f"=== is_cancel 트랜잭션 actual_plan_days 분포 분석 완료 ===\n")
+
+
+# ============================================================================
+# 8.5.3.3. is_cancel 트랜잭션 중 expire_date < prev_transaction_date 분석
+# ============================================================================
+def analyze_cancel_expire_before_prev_transaction(
+    db_path: str,
+    seq_table: str = "transactions_seq",
+    output_dir: str = "data/analysis",
+    show_samples: int | None = None,
+) -> None:
+    """
+    is_cancel=1 트랜잭션 중 membership_expire_date가 이전 트랜잭션의
+    transaction_date보다 작은 케이스를 분석합니다.
+
+    이 케이스는 취소로 인해 멤버십 만료일이 이전 결제일 이전으로 되돌아가는
+    비정상적인 상황을 나타냅니다.
+
+    Args:
+        db_path: DuckDB 데이터베이스 경로
+        seq_table: 트랜잭션 시퀀스 테이블명 (기본값: transactions_seq)
+        output_dir: 그래프 저장 디렉토리 (기본값: data/analysis)
+        show_samples: 샘플 케이스 수 (None이면 샘플 출력 안 함)
+    """
+    import matplotlib.pyplot as plt
+
+    logger.info(f"=== is_cancel expire_date < prev_transaction_date 분석 시작 ===")
+    logger.info(f"테이블: {seq_table}")
+    logger.info(f"출력 디렉토리: {output_dir}")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    con = duckdb.connect(db_path)
+    con.execute("PRAGMA threads=8;")
+
+    # 테이블 존재 확인
+    existing_tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
+    if seq_table not in existing_tables:
+        logger.error(f"테이블 {seq_table}이 존재하지 않습니다.")
+        con.close()
+        return
+
+    # is_cancel=1 전체 통계
+    cancel_stats = con.execute(f"""
+        SELECT
+            COUNT(*) AS cancel_rows,
+            COUNT(DISTINCT user_id) AS cancel_users
+        FROM {seq_table}
+        WHERE is_cancel = 1
+    """).fetchone()
+    cancel_rows, cancel_users = cancel_stats
+    logger.info(f"is_cancel=1 전체: {cancel_rows:,} 행, {cancel_users:,} 유저")
+
+    if cancel_rows == 0:
+        logger.info("is_cancel=1인 트랜잭션이 없습니다.")
+        con.close()
+        logger.info(f"=== is_cancel expire_date < prev_transaction_date 분석 완료 ===\n")
+        return
+
+    # 이전 트랜잭션의 transaction_date를 가져와서 비교
+    # membership_expire_date < LAG(transaction_date) 인 케이스 찾기
+    anomaly_stats = con.execute(f"""
+        WITH with_prev AS (
+            SELECT
+                *,
+                LAG(transaction_date) OVER (
+                    PARTITION BY user_id
+                    ORDER BY transaction_date, membership_expire_date
+                ) AS prev_transaction_date
+            FROM {seq_table}
+        )
+        SELECT
+            COUNT(*) AS anomaly_rows,
+            COUNT(DISTINCT user_id) AS anomaly_users
+        FROM with_prev
+        WHERE is_cancel = 1
+          AND prev_transaction_date IS NOT NULL
+          AND membership_expire_date < prev_transaction_date
+    """).fetchone()
+    anomaly_rows, anomaly_users = anomaly_stats
+
+    logger.info(f"\n[1] expire_date < prev_transaction_date 케이스 통계")
+    logger.info(f"  해당 케이스: {anomaly_rows:,} 행 ({anomaly_rows/cancel_rows*100:.2f}% of is_cancel=1)")
+    logger.info(f"  영향 유저: {anomaly_users:,} ({anomaly_users/cancel_users*100:.2f}% of is_cancel=1 users)")
+
+    if anomaly_rows == 0:
+        logger.info("해당 케이스가 없습니다.")
+        con.close()
+        logger.info(f"=== is_cancel expire_date < prev_transaction_date 분석 완료 ===\n")
+        return
+
+    # 2. 차이 일수 분포
+    logger.info(f"\n[2] 차이 일수 (prev_transaction_date - membership_expire_date) 분포")
+    diff_stats = con.execute(f"""
+        WITH with_prev AS (
+            SELECT
+                *,
+                LAG(transaction_date) OVER (
+                    PARTITION BY user_id
+                    ORDER BY transaction_date, membership_expire_date
+                ) AS prev_transaction_date
+            FROM {seq_table}
+        ),
+        anomaly_cases AS (
+            SELECT
+                *,
+                CAST(prev_transaction_date - membership_expire_date AS BIGINT) AS days_diff
+            FROM with_prev
+            WHERE is_cancel = 1
+              AND prev_transaction_date IS NOT NULL
+              AND membership_expire_date < prev_transaction_date
+        )
+        SELECT
+            MIN(days_diff) AS min_diff,
+            MAX(days_diff) AS max_diff,
+            ROUND(AVG(days_diff), 2) AS avg_diff,
+            ROUND(MEDIAN(days_diff), 2) AS median_diff
+        FROM anomaly_cases
+    """).fetchone()
+    logger.info(f"  min={diff_stats[0]}, max={diff_stats[1]}, avg={diff_stats[2]}, median={diff_stats[3]}")
+
+    # 3. 차이 구간별 분포
+    logger.info(f"\n[3] 차이 일수 구간별 분포")
+    bucket_dist = con.execute(f"""
+        WITH with_prev AS (
+            SELECT
+                *,
+                LAG(transaction_date) OVER (
+                    PARTITION BY user_id
+                    ORDER BY transaction_date, membership_expire_date
+                ) AS prev_transaction_date
+            FROM {seq_table}
+        ),
+        anomaly_cases AS (
+            SELECT
+                *,
+                CAST(prev_transaction_date - membership_expire_date AS BIGINT) AS days_diff
+            FROM with_prev
+            WHERE is_cancel = 1
+              AND prev_transaction_date IS NOT NULL
+              AND membership_expire_date < prev_transaction_date
+        )
+        SELECT
+            CASE
+                WHEN days_diff <= 7 THEN '1-7일'
+                WHEN days_diff <= 30 THEN '8-30일'
+                WHEN days_diff <= 90 THEN '31-90일'
+                WHEN days_diff <= 180 THEN '91-180일'
+                WHEN days_diff <= 365 THEN '181-365일'
+                ELSE '365일 초과'
+            END AS bucket,
+            COUNT(*) AS row_count,
+            COUNT(DISTINCT user_id) AS user_count
+        FROM anomaly_cases
+        GROUP BY bucket
+        ORDER BY
+            CASE bucket
+                WHEN '1-7일' THEN 1
+                WHEN '8-30일' THEN 2
+                WHEN '31-90일' THEN 3
+                WHEN '91-180일' THEN 4
+                WHEN '181-365일' THEN 5
+                ELSE 6
+            END
+    """).fetchall()
+
+    buckets = []
+    bucket_row_counts = []
+    bucket_user_counts = []
+    for bucket, row_cnt, user_cnt in bucket_dist:
+        buckets.append(bucket)
+        bucket_row_counts.append(row_cnt)
+        bucket_user_counts.append(user_cnt)
+        logger.info(f"  {bucket:>12}: {row_cnt:,} 행 ({row_cnt/anomaly_rows*100:.2f}%), {user_cnt:,} 유저")
+
+    # 4. payment_plan_days별 분포
+    logger.info(f"\n[4] payment_plan_days별 분포")
+    plan_dist = con.execute(f"""
+        WITH with_prev AS (
+            SELECT
+                *,
+                LAG(transaction_date) OVER (
+                    PARTITION BY user_id
+                    ORDER BY transaction_date, membership_expire_date
+                ) AS prev_transaction_date
+            FROM {seq_table}
+        ),
+        anomaly_cases AS (
+            SELECT
+                *,
+                CAST(prev_transaction_date - membership_expire_date AS BIGINT) AS days_diff
+            FROM with_prev
+            WHERE is_cancel = 1
+              AND prev_transaction_date IS NOT NULL
+              AND membership_expire_date < prev_transaction_date
+        )
+        SELECT
+            payment_plan_days,
+            COUNT(*) AS row_count,
+            COUNT(DISTINCT user_id) AS user_count,
+            ROUND(AVG(days_diff), 2) AS avg_diff
+        FROM anomaly_cases
+        GROUP BY payment_plan_days
+        ORDER BY row_count DESC
+        LIMIT 10
+    """).fetchall()
+
+    plan_labels = []
+    plan_row_counts = []
+    for plan, row_cnt, user_cnt, avg_diff in plan_dist:
+        plan_labels.append(str(plan))
+        plan_row_counts.append(row_cnt)
+        logger.info(f"  plan={plan}: {row_cnt:,} 행, {user_cnt:,} 유저, avg_diff={avg_diff}")
+
+    # 5. 샘플 케이스
+    if show_samples is not None and show_samples > 0:
+        logger.info(f"\n[5] 샘플 케이스 (상위 {show_samples}개)")
+        sample_cases = con.execute(f"""
+            WITH with_prev AS (
+                SELECT
+                    *,
+                    LAG(transaction_date) OVER (
+                        PARTITION BY user_id
+                        ORDER BY transaction_date, membership_expire_date
+                    ) AS prev_transaction_date
+                FROM {seq_table}
+            )
+            SELECT
+                user_id,
+                prev_transaction_date,
+                transaction_date,
+                membership_expire_date,
+                CAST(prev_transaction_date - membership_expire_date AS BIGINT) AS days_diff,
+                payment_plan_days,
+                actual_plan_days
+            FROM with_prev
+            WHERE is_cancel = 1
+              AND prev_transaction_date IS NOT NULL
+              AND membership_expire_date < prev_transaction_date
+            ORDER BY days_diff DESC
+            LIMIT {show_samples}
+        """).fetchdf()
+        logger.info(f"\n{sample_cases.to_string()}")
+
+    # 그래프 생성
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # 1. 구간별 분포 (행)
+    colors = ['#3498db', '#2ecc71', '#f39c12', '#e74c3c', '#9b59b6', '#1abc9c']
+    axes[0, 0].bar(buckets, bucket_row_counts, color=colors[:len(buckets)])
+    axes[0, 0].set_title('Days Diff Bucket Distribution (Rows)\n(prev_tx_date - expire_date)')
+    axes[0, 0].set_xlabel('Days Difference Bucket')
+    axes[0, 0].set_ylabel('Row Count')
+    axes[0, 0].tick_params(axis='x', rotation=45)
+    axes[0, 0].set_ylim(bottom=0)
+    for i, cnt in enumerate(bucket_row_counts):
+        axes[0, 0].text(i, cnt, f'{cnt:,}', ha='center', va='bottom', fontsize=9)
+
+    # 2. 구간별 분포 (유저)
+    axes[0, 1].bar(buckets, bucket_user_counts, color=colors[:len(buckets)])
+    axes[0, 1].set_title('Days Diff Bucket Distribution (Users)\n(prev_tx_date - expire_date)')
+    axes[0, 1].set_xlabel('Days Difference Bucket')
+    axes[0, 1].set_ylabel('User Count')
+    axes[0, 1].tick_params(axis='x', rotation=45)
+    axes[0, 1].set_ylim(bottom=0)
+    for i, cnt in enumerate(bucket_user_counts):
+        axes[0, 1].text(i, cnt, f'{cnt:,}', ha='center', va='bottom', fontsize=9)
+
+    # 3. payment_plan_days별 분포
+    if plan_labels:
+        axes[1, 0].bar(plan_labels, plan_row_counts, color='#3498db')
+        axes[1, 0].set_title('Distribution by payment_plan_days (Rows)')
+        axes[1, 0].set_xlabel('payment_plan_days')
+        axes[1, 0].set_ylabel('Row Count')
+        axes[1, 0].tick_params(axis='x', rotation=45)
+        axes[1, 0].set_ylim(bottom=0)
+
+    # 4. 히스토그램
+    diff_data = con.execute(f"""
+        WITH with_prev AS (
+            SELECT
+                *,
+                LAG(transaction_date) OVER (
+                    PARTITION BY user_id
+                    ORDER BY transaction_date, membership_expire_date
+                ) AS prev_transaction_date
+            FROM {seq_table}
+        )
+        SELECT CAST(prev_transaction_date - membership_expire_date AS BIGINT) AS days_diff
+        FROM with_prev
+        WHERE is_cancel = 1
+          AND prev_transaction_date IS NOT NULL
+          AND membership_expire_date < prev_transaction_date
+    """).fetchdf()
+
+    axes[1, 1].hist(diff_data['days_diff'], bins=30, color='#9b59b6', edgecolor='black', alpha=0.7)
+    axes[1, 1].set_title('Days Diff Histogram\n(prev_tx_date - expire_date)')
+    axes[1, 1].set_xlabel('Days Difference')
+    axes[1, 1].set_ylabel('Frequency')
+
+    plt.tight_layout()
+    plot_path = os.path.join(output_dir, "cancel_expire_before_prev_transaction.png")
+    plt.savefig(plot_path, dpi=150)
+    plt.close()
+    logger.info(f"\n그래프 저장: {plot_path}")
+
+    con.close()
+    logger.info(f"=== is_cancel expire_date < prev_transaction_date 분석 완료 ===\n")
+
+
+# ============================================================================
+# 8.5.3.4. is_cancel expire_date < prev_transaction_date 유저 제외
+# ============================================================================
+def exclude_cancel_expire_before_prev_transaction_users(
+    db_path: str,
+    seq_table: str = "transactions_seq",
+    target_tables: list[str] = None,
+) -> None:
+    """
+    is_cancel=1 트랜잭션 중 membership_expire_date가 이전 트랜잭션의
+    transaction_date보다 작은 케이스를 가진 유저를 모든 _merge 테이블에서 제외합니다.
+
+    Args:
+        db_path: DuckDB 데이터베이스 경로
+        seq_table: 트랜잭션 시퀀스 테이블명 (기본값: transactions_seq)
+        target_tables: 필터링을 적용할 대상 테이블 이름 리스트
+                       기본값: ["train_merge", "transactions_merge", "user_logs_merge", "members_merge"]
+    """
+    if target_tables is None:
+        target_tables = ["train_merge", "transactions_merge", "user_logs_merge", "members_merge"]
+
+    logger.info(f"=== is_cancel expire_date < prev_transaction_date 유저 제외 시작 ===")
+    logger.info(f"시퀀스 테이블: {seq_table}")
+    logger.info(f"대상 테이블: {target_tables}")
+
+    con = duckdb.connect(db_path)
+    con.execute("PRAGMA threads=8;")
+
+    existing_tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
+
+    # 시퀀스 테이블 존재 확인
+    if seq_table not in existing_tables:
+        logger.error(f"{seq_table} 테이블이 존재하지 않습니다.")
+        con.close()
+        return
+
+    # 시퀀스 테이블의 user_id 컬럼 확인
+    seq_cols = [row[0] for row in con.execute(f"DESCRIBE {seq_table}").fetchall()]
+    if "user_id" in seq_cols:
+        id_col = "user_id"
+    elif "msno" in seq_cols:
+        id_col = "msno"
+    else:
+        logger.error(f"{seq_table}에 user_id/msno 컬럼이 없습니다.")
+        con.close()
+        return
+
+    # 전체 유저 수
+    total_users = con.execute(f"""
+        SELECT COUNT(DISTINCT {id_col}) FROM {seq_table}
+    """).fetchone()[0]
+    logger.info(f"시퀀스 테이블 전체 유저 수: {total_users:,}")
+
+    # 해당 조건에 맞는 유저 추출
+    con.execute(f"""
+        CREATE OR REPLACE TABLE _cancel_expire_anomaly_users_temp AS
+        WITH with_prev AS (
+            SELECT
+                {id_col},
+                membership_expire_date,
+                is_cancel,
+                LAG(transaction_date) OVER (
+                    PARTITION BY {id_col}
+                    ORDER BY transaction_date, membership_expire_date
+                ) AS prev_transaction_date
+            FROM {seq_table}
+        )
+        SELECT DISTINCT {id_col}
+        FROM with_prev
+        WHERE is_cancel = 1
+          AND prev_transaction_date IS NOT NULL
+          AND membership_expire_date < prev_transaction_date;
+    """)
+
+    anomaly_count = con.execute("SELECT COUNT(*) FROM _cancel_expire_anomaly_users_temp").fetchone()[0]
+    logger.info(f"제외 대상 유저 수: {anomaly_count:,} ({anomaly_count/total_users*100:.2f}%)")
+
+    if anomaly_count == 0:
+        logger.info("제외할 유저가 없습니다.")
+        con.execute("DROP TABLE IF EXISTS _cancel_expire_anomaly_users_temp;")
+        con.close()
+        return
+
+    # 대상 테이블에서 해당 유저 제외
+    for t in tqdm(target_tables, desc="cancel expire anomaly 유저 제외"):
+        if t not in existing_tables:
+            logger.warning(f"  {t}: 존재하지 않음, 건너뜀")
+            continue
+
+        # 대상 테이블의 user_id 컬럼 확인
+        target_cols = [row[0] for row in con.execute(f"DESCRIBE {t}").fetchall()]
+        if "user_id" in target_cols:
+            target_col = "user_id"
+        elif "msno" in target_cols:
+            target_col = "msno"
+        else:
+            logger.warning(f"  {t}: user_id/msno 컬럼 없음, 건너뜀")
+            continue
+
+        logger.info(f"  {t} 필터링 중...")
+
+        # 필터링 전 통계
+        before_rows = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+        before_unique = con.execute(f"SELECT COUNT(DISTINCT {target_col}) FROM {t}").fetchone()[0]
+
+        # 해당 유저 제외 (NOT IN)
+        con.execute(f"""
+            CREATE OR REPLACE TABLE {t}_filtered AS
+            SELECT *
+            FROM {t}
+            WHERE {target_col} NOT IN (SELECT {id_col} FROM _cancel_expire_anomaly_users_temp);
+        """)
+
+        # 원본 테이블 교체
+        con.execute(f"DROP TABLE {t};")
+        con.execute(f"ALTER TABLE {t}_filtered RENAME TO {t};")
+
+        # 필터링 후 통계
+        after_rows = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+        after_unique = con.execute(f"SELECT COUNT(DISTINCT {target_col}) FROM {t}").fetchone()[0]
+
+        rows_removed = before_rows - after_rows
+        users_removed = before_unique - after_unique
+
+        logger.info(f"    {before_rows:,} -> {after_rows:,} 행 ({rows_removed:,} 제거)")
+        logger.info(f"    {before_unique:,} -> {after_unique:,} 고유 유저 ({users_removed:,} 제거)")
+
+    # 임시 테이블 삭제
+    con.execute("DROP TABLE IF EXISTS _cancel_expire_anomaly_users_temp;")
+
+    con.close()
+    logger.info(f"=== is_cancel expire_date < prev_transaction_date 유저 제외 완료 ===\n")
+
+
+# ============================================================================
+# 8.5.3.5. is_cancel expire_date < prev_prev_expire_date 분석
+# ============================================================================
+def analyze_cancel_expire_before_prev_prev_expire(
+    db_path: str,
+    seq_table: str = "transactions_seq",
+    output_dir: str = "data/analysis",
+    show_samples: int | None = None,
+) -> None:
+    """
+    is_cancel=1 트랜잭션 중 membership_expire_date가 이전 두 번째 트랜잭션의
+    membership_expire_date보다 작은 케이스를 분석합니다.
+
+    이 케이스는 취소로 인해 멤버십 만료일이 두 번째 이전 트랜잭션의 만료일보다
+    더 과거로 되돌아가는 비정상적인 상황을 나타냅니다.
+
+    Args:
+        db_path: DuckDB 데이터베이스 경로
+        seq_table: 트랜잭션 시퀀스 테이블명 (기본값: transactions_seq)
+        output_dir: 그래프 저장 디렉토리 (기본값: data/analysis)
+        show_samples: 샘플 케이스 수 (None이면 샘플 출력 안 함)
+    """
+    import matplotlib.pyplot as plt
+
+    logger.info(f"=== is_cancel expire_date < prev_prev_expire_date 분석 시작 ===")
+    logger.info(f"테이블: {seq_table}")
+    logger.info(f"출력 디렉토리: {output_dir}")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    con = duckdb.connect(db_path)
+    con.execute("PRAGMA threads=8;")
+
+    # 테이블 존재 확인
+    existing_tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
+    if seq_table not in existing_tables:
+        logger.error(f"테이블 {seq_table}이 존재하지 않습니다.")
+        con.close()
+        return
+
+    # is_cancel=1 전체 통계
+    cancel_stats = con.execute(f"""
+        SELECT
+            COUNT(*) AS cancel_rows,
+            COUNT(DISTINCT user_id) AS cancel_users
+        FROM {seq_table}
+        WHERE is_cancel = 1
+    """).fetchone()
+    cancel_rows, cancel_users = cancel_stats
+    logger.info(f"is_cancel=1 전체: {cancel_rows:,} 행, {cancel_users:,} 유저")
+
+    if cancel_rows == 0:
+        logger.info("is_cancel=1인 트랜잭션이 없습니다.")
+        con.close()
+        logger.info(f"=== is_cancel expire_date < prev_prev_expire_date 분석 완료 ===\n")
+        return
+
+    # 이전 두 번째 트랜잭션의 membership_expire_date를 가져와서 비교
+    # membership_expire_date < LAG(membership_expire_date, 2) 인 케이스 찾기
+    anomaly_stats = con.execute(f"""
+        WITH with_prev_prev AS (
+            SELECT
+                *,
+                LAG(membership_expire_date, 2) OVER (
+                    PARTITION BY user_id
+                    ORDER BY transaction_date, membership_expire_date
+                ) AS prev_prev_expire_date
+            FROM {seq_table}
+        )
+        SELECT
+            COUNT(*) AS anomaly_rows,
+            COUNT(DISTINCT user_id) AS anomaly_users
+        FROM with_prev_prev
+        WHERE is_cancel = 1
+          AND prev_prev_expire_date IS NOT NULL
+          AND membership_expire_date < prev_prev_expire_date
+    """).fetchone()
+    anomaly_rows, anomaly_users = anomaly_stats
+
+    logger.info(f"\n[1] expire_date < prev_prev_expire_date 케이스 통계")
+    logger.info(f"  해당 케이스: {anomaly_rows:,} 행 ({anomaly_rows/cancel_rows*100:.2f}% of is_cancel=1)")
+    logger.info(f"  영향 유저: {anomaly_users:,} ({anomaly_users/cancel_users*100:.2f}% of is_cancel=1 users)")
+
+    if anomaly_rows == 0:
+        logger.info("해당 케이스가 없습니다.")
+        con.close()
+        logger.info(f"=== is_cancel expire_date < prev_prev_expire_date 분석 완료 ===\n")
+        return
+
+    # 2. 차이 일수 분포
+    logger.info(f"\n[2] 차이 일수 (prev_prev_expire_date - membership_expire_date) 분포")
+    diff_stats = con.execute(f"""
+        WITH with_prev_prev AS (
+            SELECT
+                *,
+                LAG(membership_expire_date, 2) OVER (
+                    PARTITION BY user_id
+                    ORDER BY transaction_date, membership_expire_date
+                ) AS prev_prev_expire_date
+            FROM {seq_table}
+        ),
+        anomaly_cases AS (
+            SELECT
+                *,
+                CAST(prev_prev_expire_date - membership_expire_date AS BIGINT) AS days_diff
+            FROM with_prev_prev
+            WHERE is_cancel = 1
+              AND prev_prev_expire_date IS NOT NULL
+              AND membership_expire_date < prev_prev_expire_date
+        )
+        SELECT
+            MIN(days_diff) AS min_diff,
+            MAX(days_diff) AS max_diff,
+            ROUND(AVG(days_diff), 2) AS avg_diff,
+            ROUND(MEDIAN(days_diff), 2) AS median_diff
+        FROM anomaly_cases
+    """).fetchone()
+    logger.info(f"  min={diff_stats[0]}, max={diff_stats[1]}, avg={diff_stats[2]}, median={diff_stats[3]}")
+
+    # 3. 차이 구간별 분포
+    logger.info(f"\n[3] 차이 일수 구간별 분포")
+    bucket_dist = con.execute(f"""
+        WITH with_prev_prev AS (
+            SELECT
+                *,
+                LAG(membership_expire_date, 2) OVER (
+                    PARTITION BY user_id
+                    ORDER BY transaction_date, membership_expire_date
+                ) AS prev_prev_expire_date
+            FROM {seq_table}
+        ),
+        anomaly_cases AS (
+            SELECT
+                *,
+                CAST(prev_prev_expire_date - membership_expire_date AS BIGINT) AS days_diff
+            FROM with_prev_prev
+            WHERE is_cancel = 1
+              AND prev_prev_expire_date IS NOT NULL
+              AND membership_expire_date < prev_prev_expire_date
+        )
+        SELECT
+            CASE
+                WHEN days_diff <= 7 THEN '1-7일'
+                WHEN days_diff <= 30 THEN '8-30일'
+                WHEN days_diff <= 90 THEN '31-90일'
+                WHEN days_diff <= 180 THEN '91-180일'
+                WHEN days_diff <= 365 THEN '181-365일'
+                ELSE '365일 초과'
+            END AS bucket,
+            COUNT(*) AS row_count,
+            COUNT(DISTINCT user_id) AS user_count
+        FROM anomaly_cases
+        GROUP BY bucket
+        ORDER BY
+            CASE bucket
+                WHEN '1-7일' THEN 1
+                WHEN '8-30일' THEN 2
+                WHEN '31-90일' THEN 3
+                WHEN '91-180일' THEN 4
+                WHEN '181-365일' THEN 5
+                ELSE 6
+            END
+    """).fetchall()
+
+    buckets = []
+    bucket_row_counts = []
+    bucket_user_counts = []
+    for bucket, row_cnt, user_cnt in bucket_dist:
+        buckets.append(bucket)
+        bucket_row_counts.append(row_cnt)
+        bucket_user_counts.append(user_cnt)
+        logger.info(f"  {bucket:>12}: {row_cnt:,} 행 ({row_cnt/anomaly_rows*100:.2f}%), {user_cnt:,} 유저")
+
+    # 4. payment_plan_days별 분포
+    logger.info(f"\n[4] payment_plan_days별 분포")
+    plan_dist = con.execute(f"""
+        WITH with_prev_prev AS (
+            SELECT
+                *,
+                LAG(membership_expire_date, 2) OVER (
+                    PARTITION BY user_id
+                    ORDER BY transaction_date, membership_expire_date
+                ) AS prev_prev_expire_date
+            FROM {seq_table}
+        ),
+        anomaly_cases AS (
+            SELECT
+                *,
+                CAST(prev_prev_expire_date - membership_expire_date AS BIGINT) AS days_diff
+            FROM with_prev_prev
+            WHERE is_cancel = 1
+              AND prev_prev_expire_date IS NOT NULL
+              AND membership_expire_date < prev_prev_expire_date
+        )
+        SELECT
+            payment_plan_days,
+            COUNT(*) AS row_count,
+            COUNT(DISTINCT user_id) AS user_count,
+            ROUND(AVG(days_diff), 2) AS avg_diff
+        FROM anomaly_cases
+        GROUP BY payment_plan_days
+        ORDER BY row_count DESC
+        LIMIT 10
+    """).fetchall()
+
+    plan_labels = []
+    plan_row_counts = []
+    for plan, row_cnt, user_cnt, avg_diff in plan_dist:
+        plan_labels.append(str(plan))
+        plan_row_counts.append(row_cnt)
+        logger.info(f"  plan={plan}: {row_cnt:,} 행, {user_cnt:,} 유저, avg_diff={avg_diff}")
+
+    # 5. 샘플 케이스
+    if show_samples is not None and show_samples > 0:
+        logger.info(f"\n[5] 샘플 케이스 (상위 {show_samples}개)")
+        sample_cases = con.execute(f"""
+            WITH with_prev_prev AS (
+                SELECT
+                    *,
+                    LAG(membership_expire_date, 1) OVER (
+                        PARTITION BY user_id
+                        ORDER BY transaction_date, membership_expire_date
+                    ) AS prev_expire_date,
+                    LAG(membership_expire_date, 2) OVER (
+                        PARTITION BY user_id
+                        ORDER BY transaction_date, membership_expire_date
+                    ) AS prev_prev_expire_date
+                FROM {seq_table}
+            )
+            SELECT
+                user_id,
+                transaction_date,
+                prev_prev_expire_date,
+                prev_expire_date,
+                membership_expire_date,
+                CAST(prev_prev_expire_date - membership_expire_date AS BIGINT) AS days_diff,
+                payment_plan_days,
+                actual_plan_days
+            FROM with_prev_prev
+            WHERE is_cancel = 1
+              AND prev_prev_expire_date IS NOT NULL
+              AND membership_expire_date < prev_prev_expire_date
+            ORDER BY days_diff DESC
+            LIMIT {show_samples}
+        """).fetchdf()
+        logger.info(f"\n{sample_cases.to_string()}")
+
+    # 그래프 생성
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # 1. 구간별 분포 (행)
+    colors = ['#3498db', '#2ecc71', '#f39c12', '#e74c3c', '#9b59b6', '#1abc9c']
+    axes[0, 0].bar(buckets, bucket_row_counts, color=colors[:len(buckets)])
+    axes[0, 0].set_title('Days Diff Bucket Distribution (Rows)\n(prev_prev_expire - expire)')
+    axes[0, 0].set_xlabel('Days Difference Bucket')
+    axes[0, 0].set_ylabel('Row Count')
+    axes[0, 0].tick_params(axis='x', rotation=45)
+    axes[0, 0].set_ylim(bottom=0)
+    for i, cnt in enumerate(bucket_row_counts):
+        axes[0, 0].text(i, cnt, f'{cnt:,}', ha='center', va='bottom', fontsize=9)
+
+    # 2. 구간별 분포 (유저)
+    axes[0, 1].bar(buckets, bucket_user_counts, color=colors[:len(buckets)])
+    axes[0, 1].set_title('Days Diff Bucket Distribution (Users)\n(prev_prev_expire - expire)')
+    axes[0, 1].set_xlabel('Days Difference Bucket')
+    axes[0, 1].set_ylabel('User Count')
+    axes[0, 1].tick_params(axis='x', rotation=45)
+    axes[0, 1].set_ylim(bottom=0)
+    for i, cnt in enumerate(bucket_user_counts):
+        axes[0, 1].text(i, cnt, f'{cnt:,}', ha='center', va='bottom', fontsize=9)
+
+    # 3. payment_plan_days별 분포
+    if plan_labels:
+        axes[1, 0].bar(plan_labels, plan_row_counts, color='#3498db')
+        axes[1, 0].set_title('Distribution by payment_plan_days (Rows)')
+        axes[1, 0].set_xlabel('payment_plan_days')
+        axes[1, 0].set_ylabel('Row Count')
+        axes[1, 0].tick_params(axis='x', rotation=45)
+        axes[1, 0].set_ylim(bottom=0)
+
+    # 4. 히스토그램
+    diff_data = con.execute(f"""
+        WITH with_prev_prev AS (
+            SELECT
+                *,
+                LAG(membership_expire_date, 2) OVER (
+                    PARTITION BY user_id
+                    ORDER BY transaction_date, membership_expire_date
+                ) AS prev_prev_expire_date
+            FROM {seq_table}
+        )
+        SELECT CAST(prev_prev_expire_date - membership_expire_date AS BIGINT) AS days_diff
+        FROM with_prev_prev
+        WHERE is_cancel = 1
+          AND prev_prev_expire_date IS NOT NULL
+          AND membership_expire_date < prev_prev_expire_date
+    """).fetchdf()
+
+    axes[1, 1].hist(diff_data['days_diff'], bins=30, color='#9b59b6', edgecolor='black', alpha=0.7)
+    axes[1, 1].set_title('Days Diff Histogram\n(prev_prev_expire - expire)')
+    axes[1, 1].set_xlabel('Days Difference')
+    axes[1, 1].set_ylabel('Frequency')
+
+    plt.tight_layout()
+    plot_path = os.path.join(output_dir, "cancel_expire_before_prev_prev_expire.png")
+    plt.savefig(plot_path, dpi=150)
+    plt.close()
+    logger.info(f"\n그래프 저장: {plot_path}")
+
+    con.close()
+    logger.info(f"=== is_cancel expire_date < prev_prev_expire_date 분석 완료 ===\n")
+
+
+# ============================================================================
+# 8.5.3.6. is_cancel expire_date < prev_prev_expire_date 유저 제외
+# ============================================================================
+def exclude_cancel_expire_before_prev_prev_expire_users(
+    db_path: str,
+    seq_table: str = "transactions_seq",
+    target_tables: list[str] = None,
+) -> None:
+    """
+    is_cancel=1 트랜잭션 중 membership_expire_date가 이전 두 번째 트랜잭션의
+    membership_expire_date보다 작은 케이스를 가진 유저를 모든 _merge 테이블에서 제외합니다.
+
+    Args:
+        db_path: DuckDB 데이터베이스 경로
+        seq_table: 트랜잭션 시퀀스 테이블명 (기본값: transactions_seq)
+        target_tables: 필터링을 적용할 대상 테이블 이름 리스트
+                       기본값: ["train_merge", "transactions_merge", "user_logs_merge", "members_merge"]
+    """
+    if target_tables is None:
+        target_tables = ["train_merge", "transactions_merge", "user_logs_merge", "members_merge"]
+
+    logger.info(f"=== is_cancel expire_date < prev_prev_expire_date 유저 제외 시작 ===")
+    logger.info(f"시퀀스 테이블: {seq_table}")
+    logger.info(f"대상 테이블: {target_tables}")
+
+    con = duckdb.connect(db_path)
+    con.execute("PRAGMA threads=8;")
+
+    existing_tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
+
+    # 시퀀스 테이블 존재 확인
+    if seq_table not in existing_tables:
+        logger.error(f"{seq_table} 테이블이 존재하지 않습니다.")
+        con.close()
+        return
+
+    # 시퀀스 테이블의 user_id 컬럼 확인
+    seq_cols = [row[0] for row in con.execute(f"DESCRIBE {seq_table}").fetchall()]
+    if "user_id" in seq_cols:
+        id_col = "user_id"
+    elif "msno" in seq_cols:
+        id_col = "msno"
+    else:
+        logger.error(f"{seq_table}에 user_id/msno 컬럼이 없습니다.")
+        con.close()
+        return
+
+    # 전체 유저 수
+    total_users = con.execute(f"""
+        SELECT COUNT(DISTINCT {id_col}) FROM {seq_table}
+    """).fetchone()[0]
+    logger.info(f"시퀀스 테이블 전체 유저 수: {total_users:,}")
+
+    # 해당 조건에 맞는 유저 추출
+    con.execute(f"""
+        CREATE OR REPLACE TABLE _cancel_prev_prev_anomaly_users_temp AS
+        WITH with_prev_prev AS (
+            SELECT
+                {id_col},
+                membership_expire_date,
+                is_cancel,
+                LAG(membership_expire_date, 2) OVER (
+                    PARTITION BY {id_col}
+                    ORDER BY transaction_date, membership_expire_date
+                ) AS prev_prev_expire_date
+            FROM {seq_table}
+        )
+        SELECT DISTINCT {id_col}
+        FROM with_prev_prev
+        WHERE is_cancel = 1
+          AND prev_prev_expire_date IS NOT NULL
+          AND membership_expire_date < prev_prev_expire_date;
+    """)
+
+    anomaly_count = con.execute("SELECT COUNT(*) FROM _cancel_prev_prev_anomaly_users_temp").fetchone()[0]
+    logger.info(f"제외 대상 유저 수: {anomaly_count:,} ({anomaly_count/total_users*100:.2f}%)")
+
+    if anomaly_count == 0:
+        logger.info("제외할 유저가 없습니다.")
+        con.execute("DROP TABLE IF EXISTS _cancel_prev_prev_anomaly_users_temp;")
+        con.close()
+        return
+
+    # 대상 테이블에서 해당 유저 제외
+    for t in tqdm(target_tables, desc="cancel prev_prev expire anomaly 유저 제외"):
+        if t not in existing_tables:
+            logger.warning(f"  {t}: 존재하지 않음, 건너뜀")
+            continue
+
+        # 대상 테이블의 user_id 컬럼 확인
+        target_cols = [row[0] for row in con.execute(f"DESCRIBE {t}").fetchall()]
+        if "user_id" in target_cols:
+            target_col = "user_id"
+        elif "msno" in target_cols:
+            target_col = "msno"
+        else:
+            logger.warning(f"  {t}: user_id/msno 컬럼 없음, 건너뜀")
+            continue
+
+        logger.info(f"  {t} 필터링 중...")
+
+        # 필터링 전 통계
+        before_rows = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+        before_unique = con.execute(f"SELECT COUNT(DISTINCT {target_col}) FROM {t}").fetchone()[0]
+
+        # 해당 유저 제외 (NOT IN)
+        con.execute(f"""
+            CREATE OR REPLACE TABLE {t}_filtered AS
+            SELECT *
+            FROM {t}
+            WHERE {target_col} NOT IN (SELECT {id_col} FROM _cancel_prev_prev_anomaly_users_temp);
+        """)
+
+        # 원본 테이블 교체
+        con.execute(f"DROP TABLE {t};")
+        con.execute(f"ALTER TABLE {t}_filtered RENAME TO {t};")
+
+        # 필터링 후 통계
+        after_rows = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+        after_unique = con.execute(f"SELECT COUNT(DISTINCT {target_col}) FROM {t}").fetchone()[0]
+
+        rows_removed = before_rows - after_rows
+        users_removed = before_unique - after_unique
+
+        logger.info(f"    {before_rows:,} -> {after_rows:,} 행 ({rows_removed:,} 제거)")
+        logger.info(f"    {before_unique:,} -> {after_unique:,} 고유 유저 ({users_removed:,} 제거)")
+
+    # 임시 테이블 삭제
+    con.execute("DROP TABLE IF EXISTS _cancel_prev_prev_anomaly_users_temp;")
+
+    con.close()
+    logger.info(f"=== is_cancel expire_date < prev_prev_expire_date 유저 제외 완료 ===\n")
+
+
+# ============================================================================
+# 8.5.3.7. 연속 is_cancel=1 트랜잭션 분석
+# ============================================================================
+def analyze_consecutive_cancel_transactions(
+    db_path: str,
+    seq_table: str = "transactions_seq",
+    output_dir: str = "data/analysis",
+    show_samples: int | None = None,
+) -> None:
+    """
+    is_cancel=1 트랜잭션이 두 개 이상 연속으로 나타나는 케이스를 분석합니다.
+
+    Args:
+        db_path: DuckDB 데이터베이스 경로
+        seq_table: 트랜잭션 시퀀스 테이블명 (기본값: transactions_seq)
+        output_dir: 그래프 저장 디렉토리 (기본값: data/analysis)
+        show_samples: 샘플 유저 수 (None이면 샘플 출력 안 함)
+    """
+    logger.info(f"=== 연속 is_cancel=1 트랜잭션 분석 시작 ===")
+    logger.info(f"테이블: {seq_table}")
+    logger.info(f"출력 디렉토리: {output_dir}")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    con = duckdb.connect(db_path)
+    con.execute("PRAGMA threads=8;")
+
+    # 테이블 존재 확인
+    existing_tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
+    if seq_table not in existing_tables:
+        logger.error(f"테이블 {seq_table}이 존재하지 않습니다.")
+        con.close()
+        return
+
+    # 전체 통계
+    total_stats = con.execute(f"""
+        SELECT
+            COUNT(*) AS total_rows,
+            COUNT(DISTINCT user_id) AS total_users,
+            SUM(CASE WHEN is_cancel = 1 THEN 1 ELSE 0 END) AS total_cancel_rows
+        FROM {seq_table}
+    """).fetchone()
+    total_rows, total_users, total_cancel_rows = total_stats
+    logger.info(f"전체: {total_rows:,} 행, {total_users:,} 유저")
+    logger.info(f"전체 is_cancel=1: {total_cancel_rows:,} 행")
+
+    # 연속 is_cancel=1 케이스 찾기
+    # LAG를 사용해 이전 트랜잭션의 is_cancel을 가져오고, 둘 다 1이면 연속
+    logger.info(f"\n[1] 연속 is_cancel=1 케이스 통계")
+    consecutive_stats = con.execute(f"""
+        WITH with_prev_cancel AS (
+            SELECT
+                *,
+                LAG(is_cancel) OVER (
+                    PARTITION BY user_id
+                    ORDER BY transaction_date, membership_expire_date
+                ) AS prev_is_cancel
+            FROM {seq_table}
+        ),
+        consecutive_cancel AS (
+            SELECT *
+            FROM with_prev_cancel
+            WHERE is_cancel = 1 AND prev_is_cancel = 1
+        )
+        SELECT
+            COUNT(*) AS consecutive_count,
+            COUNT(DISTINCT user_id) AS consecutive_users
+        FROM consecutive_cancel
+    """).fetchone()
+    consecutive_count, consecutive_users = consecutive_stats
+
+    logger.info(f"  연속 is_cancel=1 행 수: {consecutive_count:,} ({consecutive_count/total_cancel_rows*100:.2f}% of cancel)")
+    logger.info(f"  영향받은 유저 수: {consecutive_users:,} ({consecutive_users/total_users*100:.4f}%)")
+
+    if consecutive_count == 0:
+        logger.info("연속 is_cancel=1 케이스가 없습니다.")
+        con.close()
+        logger.info(f"=== 연속 is_cancel=1 트랜잭션 분석 완료 ===\n")
+        return
+
+    # 연속 is_cancel 길이 분석 (연속 그룹별)
+    logger.info(f"\n[2] 연속 is_cancel=1 길이 분포")
+    # 연속 그룹을 식별하기 위해 is_cancel이 바뀌는 지점마다 새 그룹 부여
+    streak_dist = con.execute(f"""
+        WITH numbered AS (
+            SELECT
+                user_id,
+                is_cancel,
+                transaction_date,
+                membership_expire_date,
+                ROW_NUMBER() OVER (
+                    PARTITION BY user_id
+                    ORDER BY transaction_date, membership_expire_date
+                ) AS rn
+            FROM {seq_table}
+        ),
+        with_group AS (
+            SELECT
+                *,
+                rn - ROW_NUMBER() OVER (
+                    PARTITION BY user_id, is_cancel
+                    ORDER BY transaction_date, membership_expire_date
+                ) AS grp
+            FROM numbered
+        ),
+        cancel_streaks AS (
+            SELECT
+                user_id,
+                grp,
+                COUNT(*) AS streak_length
+            FROM with_group
+            WHERE is_cancel = 1
+            GROUP BY user_id, grp
+            HAVING COUNT(*) >= 2
+        )
+        SELECT
+            streak_length,
+            COUNT(*) AS streak_count,
+            COUNT(DISTINCT user_id) AS user_count
+        FROM cancel_streaks
+        GROUP BY streak_length
+        ORDER BY streak_length
+    """).fetchall()
+
+    streak_lengths = []
+    streak_counts = []
+    streak_user_counts = []
+    for streak_len, streak_cnt, user_cnt in streak_dist:
+        streak_lengths.append(streak_len)
+        streak_counts.append(streak_cnt)
+        streak_user_counts.append(user_cnt)
+        logger.info(f"  연속 {streak_len}개: {streak_cnt:,} 그룹, {user_cnt:,} 유저")
+
+    # payment_plan_days별 분포
+    logger.info(f"\n[3] 연속 is_cancel=1의 payment_plan_days별 분포")
+    plan_dist = con.execute(f"""
+        WITH with_prev_cancel AS (
+            SELECT
+                *,
+                LAG(is_cancel) OVER (
+                    PARTITION BY user_id
+                    ORDER BY transaction_date, membership_expire_date
+                ) AS prev_is_cancel
+            FROM {seq_table}
+        ),
+        consecutive_cancel AS (
+            SELECT *
+            FROM with_prev_cancel
+            WHERE is_cancel = 1 AND prev_is_cancel = 1
+        )
+        SELECT
+            payment_plan_days,
+            COUNT(*) AS row_count,
+            COUNT(DISTINCT user_id) AS user_count
+        FROM consecutive_cancel
+        GROUP BY payment_plan_days
+        ORDER BY row_count DESC
+        LIMIT 10
+    """).fetchall()
+
+    plan_labels = []
+    plan_row_counts = []
+    for plan, row_cnt, user_cnt in plan_dist:
+        plan_labels.append(str(plan))
+        plan_row_counts.append(row_cnt)
+        logger.info(f"  plan={plan}: {row_cnt:,} 행, {user_cnt:,} 유저")
+
+    # actual_plan_days별 분포
+    logger.info(f"\n[4] 연속 is_cancel=1의 actual_plan_days 구간별 분포")
+    actual_dist = con.execute(f"""
+        WITH with_prev_cancel AS (
+            SELECT
+                *,
+                LAG(is_cancel) OVER (
+                    PARTITION BY user_id
+                    ORDER BY transaction_date, membership_expire_date
+                ) AS prev_is_cancel
+            FROM {seq_table}
+        ),
+        consecutive_cancel AS (
+            SELECT *
+            FROM with_prev_cancel
+            WHERE is_cancel = 1 AND prev_is_cancel = 1
+        )
+        SELECT
+            CASE
+                WHEN actual_plan_days < 0 THEN '음수'
+                WHEN actual_plan_days = 0 THEN '0'
+                WHEN actual_plan_days <= 7 THEN '1-7'
+                WHEN actual_plan_days <= 30 THEN '8-30'
+                WHEN actual_plan_days <= 60 THEN '31-60'
+                ELSE '61+'
+            END AS bucket,
+            COUNT(*) AS row_count,
+            COUNT(DISTINCT user_id) AS user_count
+        FROM consecutive_cancel
+        GROUP BY bucket
+        ORDER BY row_count DESC
+    """).fetchall()
+
+    actual_buckets = []
+    actual_row_counts = []
+    for bucket, row_cnt, user_cnt in actual_dist:
+        actual_buckets.append(bucket)
+        actual_row_counts.append(row_cnt)
+        logger.info(f"  {bucket:>8}: {row_cnt:,} 행, {user_cnt:,} 유저")
+
+    # 샘플 케이스 출력
+    if show_samples is not None and show_samples > 0:
+        logger.info(f"\n[5] 샘플 케이스 (유저별 연속 취소 트랜잭션, {show_samples}명)")
+        sample_users = con.execute(f"""
+            WITH with_prev_cancel AS (
+                SELECT
+                    *,
+                    LAG(is_cancel) OVER (
+                        PARTITION BY user_id
+                        ORDER BY transaction_date, membership_expire_date
+                    ) AS prev_is_cancel
+                FROM {seq_table}
+            ),
+            users_with_consecutive AS (
+                SELECT DISTINCT user_id
+                FROM with_prev_cancel
+                WHERE is_cancel = 1 AND prev_is_cancel = 1
+                LIMIT {show_samples}
+            )
+            SELECT
+                s.user_id,
+                s.transaction_date,
+                s.membership_expire_date,
+                s.payment_plan_days,
+                s.actual_plan_days,
+                s.is_cancel
+            FROM {seq_table} s
+            JOIN users_with_consecutive u ON s.user_id = u.user_id
+            ORDER BY s.user_id, s.transaction_date, s.membership_expire_date
+        """).fetchdf()
+        logger.info(f"\n{sample_users.to_string()}")
+
+    # 그래프 생성
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # 1. 연속 길이별 분포 (그룹 수)
+    colors = ['#3498db', '#2ecc71', '#f39c12', '#e74c3c', '#9b59b6', '#1abc9c']
+    if streak_lengths:
+        x_labels = [str(x) for x in streak_lengths]
+        axes[0, 0].bar(x_labels, streak_counts, color=colors[:len(streak_lengths)])
+        axes[0, 0].set_title('Consecutive Cancel Streak Length Distribution\n(Group Count)')
+        axes[0, 0].set_xlabel('Streak Length')
+        axes[0, 0].set_ylabel('Group Count')
+        axes[0, 0].set_ylim(bottom=0)
+        for i, cnt in enumerate(streak_counts):
+            axes[0, 0].text(i, cnt, f'{cnt:,}', ha='center', va='bottom', fontsize=9)
+
+    # 2. 연속 길이별 분포 (유저 수)
+    if streak_lengths:
+        axes[0, 1].bar(x_labels, streak_user_counts, color=colors[:len(streak_lengths)])
+        axes[0, 1].set_title('Consecutive Cancel Streak Length Distribution\n(User Count)')
+        axes[0, 1].set_xlabel('Streak Length')
+        axes[0, 1].set_ylabel('User Count')
+        axes[0, 1].set_ylim(bottom=0)
+        for i, cnt in enumerate(streak_user_counts):
+            axes[0, 1].text(i, cnt, f'{cnt:,}', ha='center', va='bottom', fontsize=9)
+
+    # 3. payment_plan_days별 분포
+    if plan_labels:
+        axes[1, 0].bar(plan_labels, plan_row_counts, color='#3498db')
+        axes[1, 0].set_title('Consecutive Cancel by payment_plan_days')
+        axes[1, 0].set_xlabel('payment_plan_days')
+        axes[1, 0].set_ylabel('Row Count')
+        axes[1, 0].tick_params(axis='x', rotation=45)
+        axes[1, 0].set_ylim(bottom=0)
+
+    # 4. actual_plan_days 구간별 분포
+    if actual_buckets:
+        axes[1, 1].bar(actual_buckets, actual_row_counts, color='#9b59b6')
+        axes[1, 1].set_title('Consecutive Cancel by actual_plan_days Bucket')
+        axes[1, 1].set_xlabel('actual_plan_days Bucket')
+        axes[1, 1].set_ylabel('Row Count')
+        axes[1, 1].tick_params(axis='x', rotation=45)
+        axes[1, 1].set_ylim(bottom=0)
+
+    plt.tight_layout()
+    plot_path = os.path.join(output_dir, "consecutive_cancel_transactions.png")
+    plt.savefig(plot_path, dpi=150)
+    plt.close()
+    logger.info(f"\n그래프 저장: {plot_path}")
+
+    con.close()
+    logger.info(f"=== 연속 is_cancel=1 트랜잭션 분석 완료 ===\n")
+
+
+# ============================================================================
+# 8.5.3.8. 연속 is_cancel=1 유저 제외
+# ============================================================================
+def exclude_consecutive_cancel_users(
+    db_path: str,
+    seq_table: str = "transactions_seq",
+    target_tables: list[str] = None,
+) -> None:
+    """
+    is_cancel=1 트랜잭션이 두 개 이상 연속으로 나타나는 유저를 모든 _merge 테이블에서 제외합니다.
+
+    Args:
+        db_path: DuckDB 데이터베이스 경로
+        seq_table: 트랜잭션 시퀀스 테이블명 (기본값: transactions_seq)
+        target_tables: 필터링을 적용할 대상 테이블 이름 리스트
+                       기본값: ["train_merge", "transactions_merge", "user_logs_merge", "members_merge"]
+    """
+    if target_tables is None:
+        target_tables = ["train_merge", "transactions_merge", "user_logs_merge", "members_merge"]
+
+    logger.info(f"=== 연속 is_cancel=1 유저 제외 시작 ===")
+    logger.info(f"시퀀스 테이블: {seq_table}")
+    logger.info(f"대상 테이블: {target_tables}")
+
+    con = duckdb.connect(db_path)
+    con.execute("PRAGMA threads=8;")
+
+    existing_tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
+
+    # 시퀀스 테이블 존재 확인
+    if seq_table not in existing_tables:
+        logger.error(f"{seq_table} 테이블이 존재하지 않습니다.")
+        con.close()
+        return
+
+    # 시퀀스 테이블의 user_id 컬럼 확인
+    seq_cols = [row[0] for row in con.execute(f"DESCRIBE {seq_table}").fetchall()]
+    if "user_id" in seq_cols:
+        id_col = "user_id"
+    elif "msno" in seq_cols:
+        id_col = "msno"
+    else:
+        logger.error(f"{seq_table}에 user_id/msno 컬럼이 없습니다.")
+        con.close()
+        return
+
+    # 전체 유저 수
+    total_users = con.execute(f"""
+        SELECT COUNT(DISTINCT {id_col}) FROM {seq_table}
+    """).fetchone()[0]
+    logger.info(f"시퀀스 테이블 전체 유저 수: {total_users:,}")
+
+    # 연속 is_cancel=1을 가진 유저 추출
+    con.execute(f"""
+        CREATE OR REPLACE TABLE _consecutive_cancel_users_temp AS
+        WITH with_prev_cancel AS (
+            SELECT
+                {id_col},
+                is_cancel,
+                LAG(is_cancel) OVER (
+                    PARTITION BY {id_col}
+                    ORDER BY transaction_date, membership_expire_date
+                ) AS prev_is_cancel
+            FROM {seq_table}
+        )
+        SELECT DISTINCT {id_col}
+        FROM with_prev_cancel
+        WHERE is_cancel = 1 AND prev_is_cancel = 1;
+    """)
+
+    anomaly_count = con.execute("SELECT COUNT(*) FROM _consecutive_cancel_users_temp").fetchone()[0]
+    logger.info(f"제외 대상 유저 수: {anomaly_count:,} ({anomaly_count/total_users*100:.2f}%)")
+
+    if anomaly_count == 0:
+        logger.info("제외할 유저가 없습니다.")
+        con.execute("DROP TABLE IF EXISTS _consecutive_cancel_users_temp;")
+        con.close()
+        return
+
+    # 대상 테이블에서 해당 유저 제외
+    for t in tqdm(target_tables, desc="연속 is_cancel 유저 제외"):
+        if t not in existing_tables:
+            logger.warning(f"  {t}: 존재하지 않음, 건너뜀")
+            continue
+
+        # 대상 테이블의 user_id 컬럼 확인
+        target_cols = [row[0] for row in con.execute(f"DESCRIBE {t}").fetchall()]
+        if "user_id" in target_cols:
+            target_col = "user_id"
+        elif "msno" in target_cols:
+            target_col = "msno"
+        else:
+            logger.warning(f"  {t}: user_id/msno 컬럼 없음, 건너뜀")
+            continue
+
+        logger.info(f"  {t} 필터링 중...")
+
+        # 필터링 전 통계
+        before_rows = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+        before_unique = con.execute(f"SELECT COUNT(DISTINCT {target_col}) FROM {t}").fetchone()[0]
+
+        # 해당 유저 제외 (NOT IN)
+        con.execute(f"""
+            CREATE OR REPLACE TABLE {t}_filtered AS
+            SELECT *
+            FROM {t}
+            WHERE {target_col} NOT IN (SELECT {id_col} FROM _consecutive_cancel_users_temp);
+        """)
+
+        # 원본 테이블 교체
+        con.execute(f"DROP TABLE {t};")
+        con.execute(f"ALTER TABLE {t}_filtered RENAME TO {t};")
+
+        # 필터링 후 통계
+        after_rows = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+        after_unique = con.execute(f"SELECT COUNT(DISTINCT {target_col}) FROM {t}").fetchone()[0]
+
+        rows_removed = before_rows - after_rows
+        users_removed = before_unique - after_unique
+
+        logger.info(f"    {before_rows:,} -> {after_rows:,} 행 ({rows_removed:,} 제거)")
+        logger.info(f"    {before_unique:,} -> {after_unique:,} 고유 유저 ({users_removed:,} 제거)")
+
+    # 임시 테이블 삭제
+    con.execute("DROP TABLE IF EXISTS _consecutive_cancel_users_temp;")
+
+    con.close()
+    logger.info(f"=== 연속 is_cancel=1 유저 제외 완료 ===\n")
+
+
+# ============================================================================
+# 8.5.4. membership_expire_date 감소 케이스 분석
+# ============================================================================
+def analyze_expire_date_decrease(
+    db_path: str,
+    seq_table: str = "transactions_seq",
+) -> None:
+    """
+    같은 sequence_group 내에서 membership_expire_date가 감소하는 케이스를 분석합니다.
+
+    Args:
+        db_path: DuckDB 데이터베이스 경로
+        seq_table: 트랜잭션 시퀀스 테이블명 (기본값: transactions_seq)
+    """
+    logger.info(f"=== membership_expire_date 감소 케이스 분석 시작 ===")
+    logger.info(f"테이블: {seq_table}")
+
+    con = duckdb.connect(db_path)
+    con.execute("PRAGMA threads=8;")
+
+    # 테이블 존재 확인
+    existing_tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
+    if seq_table not in existing_tables:
+        logger.error(f"테이블 {seq_table}이 존재하지 않습니다.")
+        con.close()
+        return
+
+    # 전체 통계
+    total_stats = con.execute(f"""
+        SELECT
+            COUNT(*) AS total_rows,
+            COUNT(DISTINCT user_id) AS total_users,
+            COUNT(DISTINCT (user_id, sequence_group_id)) AS total_seq_groups
+        FROM {seq_table}
+    """).fetchone()
+    total_rows, total_users, total_seq_groups = total_stats
+    logger.info(f"전체: {total_rows:,} 행, {total_users:,} 유저, {total_seq_groups:,} 시퀀스 그룹")
+
+    # membership_expire_date가 감소하는 케이스 찾기
+    # 같은 user_id, sequence_group_id 내에서 이전 트랜잭션보다 expire_date가 줄어든 경우
+    decrease_stats = con.execute(f"""
+        WITH with_prev_expire AS (
+            SELECT
+                *,
+                LAG(membership_expire_date) OVER (
+                    PARTITION BY user_id, sequence_group_id
+                    ORDER BY transaction_date, membership_expire_date
+                ) AS prev_expire_date
+            FROM {seq_table}
+        ),
+        decrease_cases AS (
+            SELECT *
+            FROM with_prev_expire
+            WHERE prev_expire_date IS NOT NULL
+              AND membership_expire_date < prev_expire_date
+        )
+        SELECT
+            COUNT(*) AS decrease_count,
+            COUNT(DISTINCT user_id) AS decrease_users,
+            COUNT(DISTINCT (user_id, sequence_group_id)) AS decrease_seq_groups
+        FROM decrease_cases
+    """).fetchone()
+    decrease_count, decrease_users, decrease_seq_groups = decrease_stats
+
+    logger.info(f"\n[1] membership_expire_date 감소 케이스 전체 통계")
+    logger.info(f"  감소 케이스: {decrease_count:,} 행 ({decrease_count/total_rows*100:.4f}%)")
+    logger.info(f"  영향받은 유저: {decrease_users:,} ({decrease_users/total_users*100:.4f}%)")
+    logger.info(f"  영향받은 시퀀스 그룹: {decrease_seq_groups:,} ({decrease_seq_groups/total_seq_groups*100:.4f}%)")
+
+    if decrease_count == 0:
+        logger.info("감소 케이스가 없습니다.")
+        con.close()
+        logger.info(f"=== membership_expire_date 감소 케이스 분석 완료 ===\n")
+        return
+
+    # is_cancel 여부별 통계
+    logger.info(f"\n[2] is_cancel 여부별 감소 케이스 통계")
+    cancel_stats = con.execute(f"""
+        WITH with_prev_expire AS (
+            SELECT
+                *,
+                LAG(membership_expire_date) OVER (
+                    PARTITION BY user_id, sequence_group_id
+                    ORDER BY transaction_date, membership_expire_date
+                ) AS prev_expire_date
+            FROM {seq_table}
+        ),
+        decrease_cases AS (
+            SELECT *
+            FROM with_prev_expire
+            WHERE prev_expire_date IS NOT NULL
+              AND membership_expire_date < prev_expire_date
+        )
+        SELECT
+            is_cancel,
+            COUNT(*) AS cnt,
+            COUNT(DISTINCT user_id) AS user_cnt
+        FROM decrease_cases
+        GROUP BY is_cancel
+        ORDER BY is_cancel
+    """).fetchall()
+
+    for is_cancel, cnt, user_cnt in cancel_stats:
+        pct = cnt / decrease_count * 100
+        logger.info(f"  is_cancel={is_cancel}: {cnt:,} 행 ({pct:.2f}%), {user_cnt:,} 유저")
+
+    # 감소 폭 분포
+    logger.info(f"\n[3] 감소 폭(일) 분포")
+    decrease_dist = con.execute(f"""
+        WITH with_prev_expire AS (
+            SELECT
+                *,
+                LAG(membership_expire_date) OVER (
+                    PARTITION BY user_id, sequence_group_id
+                    ORDER BY transaction_date, membership_expire_date
+                ) AS prev_expire_date
+            FROM {seq_table}
+        ),
+        decrease_cases AS (
+            SELECT
+                *,
+                CAST(prev_expire_date - membership_expire_date AS BIGINT) AS decrease_days
+            FROM with_prev_expire
+            WHERE prev_expire_date IS NOT NULL
+              AND membership_expire_date < prev_expire_date
+        )
+        SELECT
+            CASE
+                WHEN decrease_days <= 7 THEN '1-7일'
+                WHEN decrease_days <= 30 THEN '8-30일'
+                WHEN decrease_days <= 90 THEN '31-90일'
+                WHEN decrease_days <= 180 THEN '91-180일'
+                WHEN decrease_days <= 365 THEN '181-365일'
+                ELSE '365일 초과'
+            END AS bucket,
+            COUNT(*) AS cnt,
+            is_cancel
+        FROM decrease_cases
+        GROUP BY bucket, is_cancel
+        ORDER BY
+            CASE bucket
+                WHEN '1-7일' THEN 1
+                WHEN '8-30일' THEN 2
+                WHEN '31-90일' THEN 3
+                WHEN '91-180일' THEN 4
+                WHEN '181-365일' THEN 5
+                ELSE 6
+            END,
+            is_cancel
+    """).fetchall()
+
+    # 버킷별로 그룹화하여 출력
+    from collections import defaultdict
+    bucket_data = defaultdict(lambda: {'cancel_0': 0, 'cancel_1': 0})
+    for bucket, cnt, is_cancel in decrease_dist:
+        key = f'cancel_{is_cancel}'
+        bucket_data[bucket][key] = cnt
+
+    bucket_order = ['1-7일', '8-30일', '31-90일', '91-180일', '181-365일', '365일 초과']
+    for bucket in bucket_order:
+        if bucket in bucket_data:
+            data = bucket_data[bucket]
+            total = data['cancel_0'] + data['cancel_1']
+            logger.info(f"  {bucket:>10}: 총 {total:,} (is_cancel=0: {data['cancel_0']:,}, is_cancel=1: {data['cancel_1']:,})")
+
+    # 감소 폭 통계
+    logger.info(f"\n[4] 감소 폭 상세 통계 (is_cancel별)")
+    decrease_summary = con.execute(f"""
+        WITH with_prev_expire AS (
+            SELECT
+                *,
+                LAG(membership_expire_date) OVER (
+                    PARTITION BY user_id, sequence_group_id
+                    ORDER BY transaction_date, membership_expire_date
+                ) AS prev_expire_date
+            FROM {seq_table}
+        ),
+        decrease_cases AS (
+            SELECT
+                *,
+                CAST(prev_expire_date - membership_expire_date AS BIGINT) AS decrease_days
+            FROM with_prev_expire
+            WHERE prev_expire_date IS NOT NULL
+              AND membership_expire_date < prev_expire_date
+        )
+        SELECT
+            is_cancel,
+            MIN(decrease_days) AS min_decrease,
+            MAX(decrease_days) AS max_decrease,
+            ROUND(AVG(decrease_days), 1) AS avg_decrease,
+            ROUND(MEDIAN(decrease_days), 1) AS median_decrease
+        FROM decrease_cases
+        GROUP BY is_cancel
+        ORDER BY is_cancel
+    """).fetchall()
+
+    for is_cancel, min_d, max_d, avg_d, med_d in decrease_summary:
+        logger.info(f"  is_cancel={is_cancel}: min={min_d}, max={max_d}, avg={avg_d}, median={med_d}")
+
+    # 샘플 케이스 출력
+    logger.info(f"\n[5] 감소 케이스 샘플 (상위 10개)")
+    sample_cases = con.execute(f"""
+        WITH with_prev_expire AS (
+            SELECT
+                *,
+                LAG(membership_expire_date) OVER (
+                    PARTITION BY user_id, sequence_group_id
+                    ORDER BY transaction_date, membership_expire_date
+                ) AS prev_expire_date
+            FROM {seq_table}
+        )
+        SELECT
+            user_id,
+            sequence_group_id,
+            transaction_date,
+            prev_expire_date,
+            membership_expire_date,
+            CAST(prev_expire_date - membership_expire_date AS BIGINT) AS decrease_days,
+            is_cancel,
+            payment_plan_days
+        FROM with_prev_expire
+        WHERE prev_expire_date IS NOT NULL
+          AND membership_expire_date < prev_expire_date
+        ORDER BY decrease_days DESC
+        LIMIT 10
+    """).fetchdf()
+
+    logger.info(f"\n{sample_cases.to_string()}")
+
+    con.close()
+    logger.info(f"\n=== membership_expire_date 감소 케이스 분석 완료 ===\n")
+
+
+# ============================================================================
 # 8.6. members_merge에 멤버십 시퀀스 정보 추가
 # ============================================================================
 def add_membership_seq_info(
@@ -1896,16 +5074,16 @@ if __name__ == "__main__":
     # create_merge_tables(
     #     db_path=DB_PATH,
     #     base_names=[
-    #         "train",
-    #         "transactions",
-    #         "user_logs",
-    #         "members",
+    #         "raw_train",
+    #         "raw_transactions",
+    #         "raw_user_logs",
+    #         "raw_members",
     #     ],
     #     drop_source_tables=False,
-    #     id_col="user_id",
+    #     # id_col="user_id",
     # )
 
-    # 4. user_id 매핑 생성 및 변환
+    # # 4. user_id 매핑 생성 및 변환
     # create_user_id_mapping(
     #     db_path=DB_PATH,
     #     target_tables=[
@@ -2015,7 +5193,7 @@ if __name__ == "__main__":
     #         "transactions_merge",
     #         "user_logs_merge",
     #         "members_merge",
-    #         "user_logs_with_transactions",
+    #         # "user_logs_with_transactions",
     #     ],
     #     v1_churn_value=0,           # train_v1에서 is_churn=0인 유저
     #     v2_churn_values=[0, 1],     # train_v2에서 is_churn이 0 또는 1인 유저
@@ -2055,6 +5233,39 @@ if __name__ == "__main__":
     #     max_val=86400,
     # )
 
+    # # 8.3.1. NULL total_secs 유저 제외
+    # exclude_null_total_secs_users(
+    #     db_path=DB_PATH,
+    #     logs_table="user_logs_merge",
+    #     target_tables=[
+    #         "train_merge",
+    #         "transactions_merge",
+    #         "user_logs_merge",
+    #         "members_merge",
+    #     ],
+    # )
+
+    # # 8.3.2. plan_days가 30, 31인 트랜잭션만 가진 유저 수 분석
+    # analyze_plan_days_30_31_users(
+    #     db_path=DB_PATH,
+    #     transactions_table="transactions_merge",
+    # )
+
+    # # 8.3.3. membership_expire_date가 [2015, 2017] 범위 밖인 유저 제외
+    # exclude_out_of_range_expire_date_users(
+    #     db_path=DB_PATH,
+    #     transactions_table="transactions_merge",
+    #     target_tables=[
+    #         "train_merge",
+    #         "transactions_merge",
+    #         "user_logs_merge",
+    #         "members_merge",
+    #     ],
+    #     min_year=2015,
+    #     max_year=2017,
+    # )
+
+    # # 8.4. analyze
     # analyze_feature_correlation(
     #     db_path=DB_PATH,
     #     table_name="user_logs_merge",
@@ -2088,6 +5299,125 @@ if __name__ == "__main__":
     #     cutoff_date="2017-03-31",
     # )
 
+    # # 8.5.1. transactions_seq에 actual_plan_days 추가
+    # add_actual_plan_days(
+    #     db_path=DB_PATH,
+    #     seq_table="transactions_seq",
+    # )
+
+    # # 8.5.2. actual_plan_days 분석 (음수/0/양수 분포 및 추가 통계)
+    # analyze_actual_plan_days(
+    #     db_path=DB_PATH,
+    #     seq_table="transactions_seq",
+    #     output_dir="data/analysis",
+    # )
+
+    # # 8.5.2.1. is_cancel=1 트랜잭션의 actual_plan_days 분포 분석
+    # analyze_cancel_actual_plan_days(
+    #     db_path=DB_PATH,
+    #     seq_table="transactions_seq",
+    #     output_dir="data/analysis",
+    # )
+
+    # # 8.5.3. actual_plan_days 범위 밖 유저 제외
+    # exclude_out_of_range_actual_plan_days_users(
+    #     db_path=DB_PATH,
+    #     seq_table="transactions_seq",
+    #     target_tables=[
+    #         "train_merge",
+    #         "transactions_merge",
+    #         "user_logs_merge",
+    #         "members_merge",
+    #         "transactions_seq"
+    #     ],
+    #     non_cancel_min=1,
+    #     non_cancel_max=410,
+    #     cancel_min=-410,
+    #     cancel_max=0,
+    # )
+
+    # # 8.5.3.1. plan_days_diff 컬럼 추가
+    # add_plan_days_diff(
+    #     db_path=DB_PATH,
+    #     seq_table="transactions_seq",
+    # )
+
+    # # 8.5.3.2. is_cancel 트랜잭션의 actual_plan_days 분포 분석
+    # analyze_cancel_actual_plan_days_distribution(
+    #     db_path=DB_PATH,
+    #     seq_table="transactions_seq",
+    #     output_dir="data/analysis",
+    # )
+
+    # # 8.5.3.3. is_cancel 트랜잭션 중 expire_date < prev_transaction_date 분석
+    # analyze_cancel_expire_before_prev_transaction(
+    #     db_path=DB_PATH,
+    #     seq_table="transactions_seq",
+    #     output_dir="data/analysis",
+    #     show_samples=10,
+    # )
+
+    # # 8.5.3.4. is_cancel expire_date < prev_transaction_date 유저 제외
+    # exclude_cancel_expire_before_prev_transaction_users(
+    #     db_path=DB_PATH,
+    #     seq_table="transactions_seq",
+    #     target_tables=[
+    #         "train_merge",
+    #         "transactions_merge",
+    #         "user_logs_merge",
+    #         "members_merge",
+    #         "transactions_seq",
+    #     ],
+    # )
+
+    # # 8.5.3.5. is_cancel expire_date < prev_prev_expire_date 분석
+    # analyze_cancel_expire_before_prev_prev_expire(
+    #     db_path=DB_PATH,
+    #     seq_table="transactions_seq",
+    #     output_dir="data/analysis",
+    #     show_samples=10,
+    # )
+
+    # # 8.5.3.6. is_cancel expire_date < prev_prev_expire_date 유저 제외
+    # exclude_cancel_expire_before_prev_prev_expire_users(
+    #     db_path=DB_PATH,
+    #     seq_table="transactions_seq",
+    #     target_tables=[
+    #         "train_merge",
+    #         "transactions_merge",
+    #         "user_logs_merge",
+    #         "members_merge",
+    #         "transactions_seq",
+    #     ],
+    # )
+
+    # # 8.5.3.7. 연속 is_cancel=1 트랜잭션 분석
+    # analyze_consecutive_cancel_transactions(
+    #     db_path=DB_PATH,
+    #     seq_table="transactions_seq",
+    #     output_dir="data/analysis",
+    #     show_samples=3,
+    # )
+
+    # # 8.5.3.8. 연속 is_cancel=1 유저 제외
+    # exclude_consecutive_cancel_users(
+    #     db_path=DB_PATH,
+    #     seq_table="transactions_seq",
+    #     target_tables=[
+    #         "train_merge",
+    #         "transactions_merge",
+    #         "user_logs_merge",
+    #         "members_merge",
+    #         "transactions_seq",
+    #     ],
+    # )
+
+    # # 8.5.4. membership_expire_date 감소 케이스 분석
+    # analyze_expire_date_decrease(
+    #     db_path=DB_PATH,
+    #     seq_table="transactions_seq",
+    # )
+
     # # 8.6. members_merge에 멤버십 시퀀스 정보 추가
     # add_membership_seq_info(
     #     db_path=DB_PATH,
@@ -2102,17 +5432,17 @@ if __name__ == "__main__":
     #     seq_table="transactions_seq",
     # )
 
-    # # 8.8. user_logs_merge에 total_hours 컬럼 추가
-    # add_converted_column(
-    #     db_path=DB_PATH,
-    #     table_name="user_logs_merge",
-    #     source_col="total_secs",
-    #     target_col="total_hours",
-    #     divisor=3600,
-    #     # clip_min=0,
-    #     # clip_max=24,
-    #     force_overwrite=True,
-    # )
+    # 8.8. user_logs_merge에 total_hours 컬럼 추가
+    add_converted_column(
+        db_path=DB_PATH,
+        table_name="user_logs_merge",
+        source_col="total_secs",
+        target_col="total_hours",
+        divisor=3600,
+        # clip_min=0,
+        # clip_max=24,
+        force_overwrite=True,
+    )
 
     # # 8.9. Feature 클리핑 구간 분석
     # analyze_clipping_distribution(
@@ -2125,7 +5455,7 @@ if __name__ == "__main__":
     #     sample_size=1_000_000,  # 대용량 테이블은 샘플링 권장
     # )
 
-    # 8.10. 조건부 데이터 변환 (이상치 처리 등)
+    # # 8.10. 조건부 데이터 변환 (이상치 처리 등)
     # apply_conditional_transform(
     #     db_path=DB_PATH,
     #     table_name="user_logs_merge",
@@ -2176,7 +5506,7 @@ if __name__ == "__main__":
             "members_merge",
             "transactions_seq",
 
-            # "user_id_map",
+            "user_id_map",
 
             # "user_logs_with_transactions"
         ],

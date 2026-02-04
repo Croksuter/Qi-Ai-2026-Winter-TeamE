@@ -1255,6 +1255,7 @@ def analyze_feature_correlation(
     sample_size: int = None,
     corr_threshold: float = 0.5,
     null_handling: str = "dropna",
+    null_values: dict = None,
 ) -> None:
     """
     테이블의 수치형 컬럼 간 상관관계를 분석하고 히트맵을 저장합니다.
@@ -1270,6 +1271,13 @@ def analyze_feature_correlation(
             - "dropna": NULL이 있는 행 제외
             - "fillzero": NULL을 0으로 채움
             - "fillmean": NULL을 해당 컬럼 평균으로 채움
+        null_values: 특정 값을 NULL로 간주할 컬럼별 설정 (기본값: None)
+            예시:
+            {
+                "gender": [-1],                    # -1을 NULL로 간주
+                "bd": {"min": 0, "max": 100},      # 0~100 범위 밖을 NULL로 간주
+                "total_secs": {"min": 0, "max": 86400},
+            }
     """
     import matplotlib.pyplot as plt
     import seaborn as sns
@@ -1320,6 +1328,26 @@ def analyze_feature_correlation(
         query = f"SELECT {cols_str} FROM {table_name}"
 
     df = con.execute(query).fetchdf()
+
+    # null_values 처리: 특정 값을 NULL로 변환
+    if null_values:
+        import numpy as np
+        logger.info(f"null_values 처리:")
+        for col, rule in null_values.items():
+            if col not in df.columns:
+                continue
+            if isinstance(rule, list):
+                # 특정 값 리스트를 NULL로
+                df.loc[df[col].isin(rule), col] = np.nan
+                logger.info(f"  {col}: {rule} -> NULL")
+            elif isinstance(rule, dict):
+                # min/max 범위 밖을 NULL로
+                min_val = rule.get("min", float("-inf"))
+                max_val = rule.get("max", float("inf"))
+                mask = (df[col] < min_val) | (df[col] > max_val)
+                null_count = mask.sum()
+                df.loc[mask, col] = np.nan
+                logger.info(f"  {col}: 범위 [{min_val}, {max_val}] 밖 {null_count:,}개 -> NULL")
 
     # NULL 처리
     if null_handling == "dropna":
