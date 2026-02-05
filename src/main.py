@@ -78,6 +78,8 @@ logger = logging.getLogger(__name__)
 def rename_tables_add_v1_suffix(
     db_path: str,
     tables: list[str],
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     지정된 테이블들에 _v1 suffix를 추가합니다.
@@ -85,15 +87,20 @@ def rename_tables_add_v1_suffix(
     Args:
         db_path: DuckDB 데이터베이스 경로
         tables: _v1 suffix를 추가할 테이블 이름 리스트
+        num_samples: 샘플 변경 테이블 수 (None이면 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
     """
     logger.info(f"=== 테이블 이름 정규화 (_v1 추가) 시작 ===")
     logger.info(f"대상 테이블: {tables}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     con = duckdb.connect(db_path)
 
     existing_tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
 
     renamed_count = 0
+    renamed_pairs: list[tuple[str, str]] = []
     for table in tqdm(tables, desc="테이블 이름 정규화"):
         if table not in existing_tables:
             logger.warning(f"  {table}: 존재하지 않음, 건너뜀")
@@ -105,14 +112,26 @@ def rename_tables_add_v1_suffix(
             logger.warning(f"  {new_name}: 이미 존재, 건너뜀")
             continue
 
+        if dry_run:
+            logger.info(f"  {table} -> {new_name} (dry_run)")
+            renamed_count += 1
+            renamed_pairs.append((table, new_name))
+            continue
+
         con.execute(f"ALTER TABLE {table} RENAME TO {new_name}")
         logger.info(f"  {table} -> {new_name}")
         renamed_count += 1
+        renamed_pairs.append((table, new_name))
 
     # 최종 테이블 목록
     final_tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
     logger.info(f"변경된 테이블 수: {renamed_count}")
     logger.info(f"최종 테이블 목록: {final_tables}")
+
+    if num_samples is not None and num_samples > 0 and renamed_pairs:
+        sample_pairs = renamed_pairs[:num_samples]
+        sample_text = "\n".join([f"  {old} -> {new}" for old, new in sample_pairs])
+        logger.info(f"샘플 변경 테이블 ({len(sample_pairs)}개):\n{sample_text}")
 
     con.close()
     logger.info(f"=== 테이블 이름 정규화 완료 ===\n")
@@ -126,6 +145,8 @@ def create_merge_tables(
     base_names: list[str],
     drop_source_tables: bool = False,
     id_col: str = "msno",
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     v1, v2 테이블을 병합하여 _merge 테이블을 생성합니다.
@@ -138,10 +159,14 @@ def create_merge_tables(
         db_path: DuckDB 데이터베이스 경로
         base_names: 병합할 기본 테이블 이름 리스트 (예: ["train", "transactions", "user_logs", "members"])
         drop_source_tables: True면 병합 후 원본 테이블(v1, v2, v3) 삭제 (기본값: True)
+        num_samples: 샘플 출력 행 수 (None이면 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
     """
     logger.info(f"=== _merge 테이블 생성 시작 ===")
     logger.info(f"병합 대상: {base_names}")
     logger.info(f"원본 테이블 삭제: {drop_source_tables}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     con = duckdb.connect(db_path)
     con.execute("PRAGMA threads=8;")
@@ -149,6 +174,8 @@ def create_merge_tables(
     # 모든 테이블 조회
     tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
     logger.info(f"현재 테이블 목록: {tables}")
+
+    created_tables: list[str] = []
 
     for base in tqdm(base_names, desc="병합 테이블 생성"):
         v1_name = f"{base}_v1"
@@ -165,12 +192,21 @@ def create_merge_tables(
         # members 특수 처리: members_v3 -> members_merge
         if base == "raw_members":
             if v3_exists:
-                con.execute(f"""
-                    CREATE OR REPLACE TABLE {merge_name} AS
-                    SELECT * FROM {v3_name};
-                """)
-                row_count = con.execute(f"SELECT COUNT(*) FROM {merge_name}").fetchone()[0]
-                logger.info(f"    {merge_name}: {v3_name}에서 복사, {row_count:,} 행")
+                merge_query = f"SELECT * FROM {v3_name}"
+                if dry_run:
+                    row_count = con.execute(f"SELECT COUNT(*) FROM ({merge_query}) t").fetchone()[0]
+                    logger.info(f"    {merge_name}: {v3_name}에서 복사 예정, {row_count:,} 행")
+                    if num_samples is not None and num_samples > 0:
+                        sample = con.execute(f"SELECT * FROM ({merge_query}) t LIMIT {num_samples}").fetchdf()
+                        logger.info(f"샘플 데이터 ({merge_name}, 상위 {num_samples}개, dry_run):\n{sample.to_string()}")
+                else:
+                    con.execute(f"""
+                        CREATE OR REPLACE TABLE {merge_name} AS
+                        SELECT * FROM {v3_name};
+                    """)
+                    row_count = con.execute(f"SELECT COUNT(*) FROM {merge_name}").fetchone()[0]
+                    logger.info(f"    {merge_name}: {v3_name}에서 복사, {row_count:,} 행")
+                    created_tables.append(merge_name)
             else:
                 logger.warning(f"    {base}: members_v3 없음, 건너뜀")
             continue
@@ -178,8 +214,7 @@ def create_merge_tables(
         # train 특수 처리: v2 우선 업데이트
         if base == "raw_train":
             if v1_exists and v2_exists:
-                con.execute(f"""
-                    CREATE OR REPLACE TABLE {merge_name} AS
+                merge_query = f"""
                     SELECT *
                     EXCLUDE (rn, priority)
                     FROM (
@@ -194,43 +229,120 @@ def create_merge_tables(
                             FROM {v1_name} t1
                         ) u
                     ) ranked
-                    WHERE rn = 1;
-                """)
-                row_count = con.execute(f"SELECT COUNT(*) FROM {merge_name}").fetchone()[0]
-                distinct_msno = con.execute(f"SELECT COUNT(DISTINCT {id_col}) FROM {merge_name}").fetchone()[0]
-                logger.info(f"    {merge_name}: v2 우선 병합, {row_count:,} 행, {distinct_msno:,} 고유 {id_col}")
+                    WHERE rn = 1
+                """
+                if dry_run:
+                    row_count = con.execute(f"SELECT COUNT(*) FROM ({merge_query}) t").fetchone()[0]
+                    distinct_msno = row_count
+                    logger.info(f"    {merge_name}: v2 우선 병합 예정, {row_count:,} 행, {distinct_msno:,} 고유 {id_col}")
+                    if num_samples is not None and num_samples > 0:
+                        sample = con.execute(f"SELECT * FROM ({merge_query}) t LIMIT {num_samples}").fetchdf()
+                        logger.info(f"샘플 데이터 ({merge_name}, 상위 {num_samples}개, dry_run):\n{sample.to_string()}")
+                else:
+                    con.execute(f"""
+                        CREATE OR REPLACE TABLE {merge_name} AS
+                        SELECT *
+                        EXCLUDE (rn, priority)
+                        FROM (
+                            SELECT
+                                *,
+                                row_number() OVER (PARTITION BY {id_col} ORDER BY priority) AS rn
+                            FROM (
+                                SELECT t2.*, 0 AS priority
+                                FROM {v2_name} t2
+                                UNION ALL
+                                SELECT t1.*, 1 AS priority
+                                FROM {v1_name} t1
+                            ) u
+                        ) ranked
+                        WHERE rn = 1;
+                    """)
+                    row_count = con.execute(f"SELECT COUNT(*) FROM {merge_name}").fetchone()[0]
+                    distinct_msno = con.execute(f"SELECT COUNT(DISTINCT {id_col}) FROM {merge_name}").fetchone()[0]
+                    logger.info(f"    {merge_name}: v2 우선 병합, {row_count:,} 행, {distinct_msno:,} 고유 {id_col}")
+                    created_tables.append(merge_name)
             elif v1_exists:
-                con.execute(f"CREATE OR REPLACE TABLE {merge_name} AS SELECT * FROM {v1_name};")
-                row_count = con.execute(f"SELECT COUNT(*) FROM {merge_name}").fetchone()[0]
-                logger.info(f"    {merge_name}: {v1_name}에서 복사, {row_count:,} 행")
+                merge_query = f"SELECT * FROM {v1_name}"
+                if dry_run:
+                    row_count = con.execute(f"SELECT COUNT(*) FROM ({merge_query}) t").fetchone()[0]
+                    logger.info(f"    {merge_name}: {v1_name}에서 복사 예정, {row_count:,} 행")
+                    if num_samples is not None and num_samples > 0:
+                        sample = con.execute(f"SELECT * FROM ({merge_query}) t LIMIT {num_samples}").fetchdf()
+                        logger.info(f"샘플 데이터 ({merge_name}, 상위 {num_samples}개, dry_run):\n{sample.to_string()}")
+                else:
+                    con.execute(f"CREATE OR REPLACE TABLE {merge_name} AS SELECT * FROM {v1_name};")
+                    row_count = con.execute(f"SELECT COUNT(*) FROM {merge_name}").fetchone()[0]
+                    logger.info(f"    {merge_name}: {v1_name}에서 복사, {row_count:,} 행")
+                    created_tables.append(merge_name)
             elif v2_exists:
-                con.execute(f"CREATE OR REPLACE TABLE {merge_name} AS SELECT * FROM {v2_name};")
-                row_count = con.execute(f"SELECT COUNT(*) FROM {merge_name}").fetchone()[0]
-                logger.info(f"    {merge_name}: {v2_name}에서 복사, {row_count:,} 행")
+                merge_query = f"SELECT * FROM {v2_name}"
+                if dry_run:
+                    row_count = con.execute(f"SELECT COUNT(*) FROM ({merge_query}) t").fetchone()[0]
+                    logger.info(f"    {merge_name}: {v2_name}에서 복사 예정, {row_count:,} 행")
+                    if num_samples is not None and num_samples > 0:
+                        sample = con.execute(f"SELECT * FROM ({merge_query}) t LIMIT {num_samples}").fetchdf()
+                        logger.info(f"샘플 데이터 ({merge_name}, 상위 {num_samples}개, dry_run):\n{sample.to_string()}")
+                else:
+                    con.execute(f"CREATE OR REPLACE TABLE {merge_name} AS SELECT * FROM {v2_name};")
+                    row_count = con.execute(f"SELECT COUNT(*) FROM {merge_name}").fetchone()[0]
+                    logger.info(f"    {merge_name}: {v2_name}에서 복사, {row_count:,} 행")
+                    created_tables.append(merge_name)
             else:
                 logger.warning(f"    {base}: v1, v2 모두 없음, 건너뜀")
             continue
 
         # 일반 테이블: UNION ALL (concat)
         if v1_exists and v2_exists:
-            con.execute(f"""
-                CREATE OR REPLACE TABLE {merge_name} AS
-                SELECT * FROM {v1_name}
-                UNION ALL
-                SELECT * FROM {v2_name};
-            """)
-            row_count = con.execute(f"SELECT COUNT(*) FROM {merge_name}").fetchone()[0]
-            logger.info(f"    {merge_name}: v1 + v2 concat, {row_count:,} 행")
+            merge_query = f"SELECT * FROM {v1_name} UNION ALL SELECT * FROM {v2_name}"
+            if dry_run:
+                row_count = con.execute(f"SELECT COUNT(*) FROM ({merge_query}) t").fetchone()[0]
+                logger.info(f"    {merge_name}: v1 + v2 concat 예정, {row_count:,} 행")
+                if num_samples is not None and num_samples > 0:
+                    sample = con.execute(f"SELECT * FROM ({merge_query}) t LIMIT {num_samples}").fetchdf()
+                    logger.info(f"샘플 데이터 ({merge_name}, 상위 {num_samples}개, dry_run):\n{sample.to_string()}")
+            else:
+                con.execute(f"""
+                    CREATE OR REPLACE TABLE {merge_name} AS
+                    SELECT * FROM {v1_name}
+                    UNION ALL
+                    SELECT * FROM {v2_name};
+                """)
+                row_count = con.execute(f"SELECT COUNT(*) FROM {merge_name}").fetchone()[0]
+                logger.info(f"    {merge_name}: v1 + v2 concat, {row_count:,} 행")
+                created_tables.append(merge_name)
         elif v1_exists:
-            con.execute(f"CREATE OR REPLACE TABLE {merge_name} AS SELECT * FROM {v1_name};")
-            row_count = con.execute(f"SELECT COUNT(*) FROM {merge_name}").fetchone()[0]
-            logger.info(f"    {merge_name}: {v1_name}에서 복사, {row_count:,} 행")
+            merge_query = f"SELECT * FROM {v1_name}"
+            if dry_run:
+                row_count = con.execute(f"SELECT COUNT(*) FROM ({merge_query}) t").fetchone()[0]
+                logger.info(f"    {merge_name}: {v1_name}에서 복사 예정, {row_count:,} 행")
+                if num_samples is not None and num_samples > 0:
+                    sample = con.execute(f"SELECT * FROM ({merge_query}) t LIMIT {num_samples}").fetchdf()
+                    logger.info(f"샘플 데이터 ({merge_name}, 상위 {num_samples}개, dry_run):\n{sample.to_string()}")
+            else:
+                con.execute(f"CREATE OR REPLACE TABLE {merge_name} AS SELECT * FROM {v1_name};")
+                row_count = con.execute(f"SELECT COUNT(*) FROM {merge_name}").fetchone()[0]
+                logger.info(f"    {merge_name}: {v1_name}에서 복사, {row_count:,} 행")
+                created_tables.append(merge_name)
         elif v2_exists:
-            con.execute(f"CREATE OR REPLACE TABLE {merge_name} AS SELECT * FROM {v2_name};")
-            row_count = con.execute(f"SELECT COUNT(*) FROM {merge_name}").fetchone()[0]
-            logger.info(f"    {merge_name}: {v2_name}에서 복사, {row_count:,} 행")
+            merge_query = f"SELECT * FROM {v2_name}"
+            if dry_run:
+                row_count = con.execute(f"SELECT COUNT(*) FROM ({merge_query}) t").fetchone()[0]
+                logger.info(f"    {merge_name}: {v2_name}에서 복사 예정, {row_count:,} 행")
+                if num_samples is not None and num_samples > 0:
+                    sample = con.execute(f"SELECT * FROM ({merge_query}) t LIMIT {num_samples}").fetchdf()
+                    logger.info(f"샘플 데이터 ({merge_name}, 상위 {num_samples}개, dry_run):\n{sample.to_string()}")
+            else:
+                con.execute(f"CREATE OR REPLACE TABLE {merge_name} AS SELECT * FROM {v2_name};")
+                row_count = con.execute(f"SELECT COUNT(*) FROM {merge_name}").fetchone()[0]
+                logger.info(f"    {merge_name}: {v2_name}에서 복사, {row_count:,} 행")
+                created_tables.append(merge_name)
         else:
             logger.warning(f"    {base}: v1, v2 모두 없음, 건너뜀")
+
+    if not dry_run and num_samples is not None and num_samples > 0 and created_tables:
+        for table in created_tables:
+            sample = con.execute(f"SELECT * FROM {table} LIMIT {num_samples}").fetchdf()
+            logger.info(f"샘플 데이터 ({table}, 상위 {num_samples}개):\n{sample.to_string()}")
 
     # 원본 테이블 삭제
     if drop_source_tables:
@@ -242,11 +354,16 @@ def create_merge_tables(
                 if table_name in tables:
                     tables_to_drop.append(table_name)
 
-        for table in tables_to_drop:
-            con.execute(f"DROP TABLE IF EXISTS {table}")
-            logger.info(f"    {table}: 삭제됨")
+        if dry_run:
+            logger.info(f"  총 {len(tables_to_drop)}개 원본 테이블 삭제 예정 (dry_run)")
+            for table in tables_to_drop:
+                logger.info(f"    {table}: 삭제 예정 (dry_run)")
+        else:
+            for table in tables_to_drop:
+                con.execute(f"DROP TABLE IF EXISTS {table}")
+                logger.info(f"    {table}: 삭제됨")
 
-        logger.info(f"  총 {len(tables_to_drop)}개 원본 테이블 삭제됨")
+            logger.info(f"  총 {len(tables_to_drop)}개 원본 테이블 삭제됨")
 
     con.close()
     logger.info(f"=== _merge 테이블 생성 완료 ===\n")
@@ -259,6 +376,8 @@ def create_user_id_mapping(
     db_path: str,
     target_tables: list[str],
     mapping_table_name: str = "user_id_map",
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     지정된 테이블들에서 유니크 msno를 수집하여 정수 user_id로 매핑하고,
@@ -268,9 +387,13 @@ def create_user_id_mapping(
         db_path: DuckDB 데이터베이스 경로
         target_tables: 매핑을 적용할 테이블 이름 리스트
         mapping_table_name: 매핑 테이블 이름
+        num_samples: 샘플 출력 행 수 (None이면 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
     """
     logger.info(f"=== user_id 매핑 시작 ===")
     logger.info(f"대상 테이블: {target_tables}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     con = duckdb.connect(db_path)
     con.execute("PRAGMA threads=8;")
@@ -300,6 +423,70 @@ def create_user_id_mapping(
     union_parts = [f"SELECT DISTINCT msno FROM {t}" for t in tables_with_msno]
     union_query = " UNION ".join(union_parts)
 
+    if dry_run:
+        total_users = con.execute(f"""
+            SELECT COUNT(*) FROM (
+                {union_query}
+            ) t
+            WHERE msno IS NOT NULL AND msno <> ''
+        """).fetchone()[0]
+        min_id = 0 if total_users > 0 else None
+        max_id = total_users - 1 if total_users > 0 else None
+
+        logger.info(f"매핑 테이블 생성 예정: {mapping_table_name}")
+        logger.info(f"  총 사용자 수: {total_users:,}")
+        logger.info(f"  user_id 범위: {min_id} ~ {max_id}")
+
+        if num_samples is not None and num_samples > 0:
+            sample = con.execute(f"""
+                SELECT
+                    msno,
+                    (row_number() OVER (ORDER BY msno)) - 1 AS user_id
+                FROM ({union_query}) t
+                WHERE msno IS NOT NULL AND msno <> ''
+                LIMIT {num_samples}
+            """).fetchdf()
+            logger.info(f"샘플 매핑 데이터 (상위 {num_samples}개):\n{sample.to_string()}")
+
+        dup_count = con.execute(f"""
+            SELECT COUNT(*) FROM (
+                SELECT msno FROM ({union_query}) t
+                WHERE msno IS NOT NULL AND msno <> ''
+                GROUP BY msno HAVING COUNT(*) > 1
+            )
+        """).fetchone()[0]
+        if dup_count > 0:
+            logger.warning(f"  중복 msno 발견: {dup_count}개")
+        else:
+            logger.info(f"  중복 msno: 없음")
+
+        for table in tqdm(tables_with_msno, desc="msno -> user_id 변환"):
+            logger.info(f"  {table} 변환 중...")
+
+            original_count = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            new_count = con.execute(f"""
+                WITH mapping AS (
+                    SELECT
+                        msno,
+                        (row_number() OVER (ORDER BY msno)) - 1 AS user_id
+                    FROM ({union_query}) t
+                    WHERE msno IS NOT NULL AND msno <> ''
+                )
+                SELECT COUNT(*)
+                FROM {table} t
+                JOIN mapping m USING (msno);
+            """).fetchone()[0]
+
+            lost_rows = original_count - new_count
+            if lost_rows > 0:
+                logger.warning(f"    매칭되지 않은 행: {lost_rows:,}")
+            else:
+                logger.info(f"    완료: {new_count:,} 행 (손실 없음)")
+
+        con.close()
+        logger.info(f"=== user_id 매핑 완료 ===\n")
+        return
+
     con.execute(f"""
         CREATE OR REPLACE TABLE {mapping_table_name} AS
         SELECT
@@ -317,6 +504,14 @@ def create_user_id_mapping(
     logger.info(f"매핑 테이블 생성: {mapping_table_name}")
     logger.info(f"  총 사용자 수: {total_users:,}")
     logger.info(f"  user_id 범위: {min_id} ~ {max_id}")
+
+    if num_samples is not None and num_samples > 0:
+        sample = con.execute(f"""
+            SELECT msno, user_id
+            FROM {mapping_table_name}
+            LIMIT {num_samples}
+        """).fetchdf()
+        logger.info(f"샘플 매핑 데이터 (상위 {num_samples}개):\n{sample.to_string()}")
 
     # 중복 확인
     dup_count = con.execute(f"""
@@ -368,6 +563,8 @@ def filter_common_msno(
     db_path: str,
     target_tables: list[str],
     id_col: str = "msno",
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     지정된 테이블들에 공통으로 존재하는 msno(user_id)만 남깁니다.
@@ -376,9 +573,13 @@ def filter_common_msno(
     Args:
         db_path: DuckDB 데이터베이스 경로
         target_tables: 교집합 필터링을 적용할 테이블 이름 리스트
+        num_samples: 제거 샘플 출력 행 수 (None이면 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
     """
     logger.info(f"=== 공통 {id_col} 교집합 필터링 시작 ===")
     logger.info(f"대상 테이블: {target_tables}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     con = duckdb.connect(db_path)
     con.execute("PRAGMA threads=8;")
@@ -424,24 +625,71 @@ def filter_common_msno(
 
     intersect_query = " INTERSECT ".join(intersect_parts)
 
+    common_count = con.execute(f"""
+        SELECT COUNT(*) FROM (
+            {intersect_query}
+        ) t
+    """).fetchone()[0]
+    logger.info(f"공통 {id_col} (교집합) 수: {common_count:,}")
+
+    if common_count == 0:
+        logger.error(f"공통 {id_col}가 없습니다! 필터링을 중단합니다.")
+        con.close()
+        return
+
+    if dry_run:
+        for t in tqdm(tables_with_msno, desc="교집합 필터링"):
+            col = msno_col_name[t]
+            logger.info(f"  {t} 필터링 중...")
+
+            if num_samples is not None and num_samples > 0:
+                removed_sample = con.execute(f"""
+                    SELECT {col} AS {id_col}
+                    FROM {t}
+                    WHERE {col} NOT IN ({intersect_query})
+                    LIMIT {num_samples}
+                """).fetchdf()
+                if not removed_sample.empty:
+                    logger.info(f"    제거 샘플 ({t}, 상위 {num_samples}개):\n{removed_sample.to_string()}")
+
+            after_rows = con.execute(f"""
+                SELECT COUNT(*) FROM {t}
+                WHERE {col} IN ({intersect_query});
+            """).fetchone()[0]
+            after_unique = con.execute(f"""
+                SELECT COUNT(DISTINCT {col}) FROM {t}
+                WHERE {col} IN ({intersect_query});
+            """).fetchone()[0]
+
+            rows_removed = before_stats[t]["rows"] - after_rows
+            msno_removed = before_stats[t]["unique_msno"] - after_unique
+
+            logger.info(f"    {before_stats[t]['rows']:,} -> {after_rows:,} 행 ({rows_removed:,} 제거)")
+            logger.info(f"    {before_stats[t]['unique_msno']:,} -> {after_unique:,} 고유 {id_col} ({msno_removed:,} 제거)")
+
+        con.close()
+        logger.info(f"=== 공통 {id_col} 교집합 필터링 완료 ===\n")
+        return
+
     con.execute(f"""
         CREATE OR REPLACE TABLE _common_msno_temp AS
         {intersect_query};
     """)
 
-    common_count = con.execute("SELECT COUNT(*) FROM _common_msno_temp").fetchone()[0]
-    logger.info(f"공통 {id_col} (교집합) 수: {common_count:,}")
-
-    if common_count == 0:
-        logger.error(f"공통 {id_col}가 없습니다! 필터링을 중단합니다.")
-        con.execute("DROP TABLE IF EXISTS _common_msno_temp;")
-        con.close()
-        return
-
     # 각 테이블에서 교집합에 해당하는 행만 남기기
     for t in tqdm(tables_with_msno, desc="교집합 필터링"):
         col = msno_col_name[t]
         logger.info(f"  {t} 필터링 중...")
+
+        if num_samples is not None and num_samples > 0:
+            removed_sample = con.execute(f"""
+                SELECT {col} AS {id_col}
+                FROM {t}
+                WHERE {col} NOT IN (SELECT {id_col} FROM _common_msno_temp)
+                LIMIT {num_samples}
+            """).fetchdf()
+            if not removed_sample.empty:
+                logger.info(f"    제거 샘플 ({t}, 상위 {num_samples}개):\n{removed_sample.to_string()}")
 
         con.execute(f"""
             CREATE OR REPLACE TABLE {t}_filtered AS
@@ -481,6 +729,8 @@ def filter_by_reference_table(
     db_path: str,
     reference_table: str,
     target_tables: list[str],
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     기준 테이블에 존재하는 msno(user_id)만 남기도록 대상 테이블들을 필터링합니다.
@@ -489,10 +739,14 @@ def filter_by_reference_table(
         db_path: DuckDB 데이터베이스 경로
         reference_table: 기준이 되는 테이블 이름 (이 테이블의 msno를 기준으로 필터링)
         target_tables: 필터링을 적용할 대상 테이블 이름 리스트
+        num_samples: 제거 샘플 출력 행 수 (None이면 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
     """
     logger.info(f"=== 기준 테이블 기반 msno 필터링 시작 ===")
     logger.info(f"기준 테이블: {reference_table}")
     logger.info(f"대상 테이블: {target_tables}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     con = duckdb.connect(db_path)
     con.execute("PRAGMA threads=8;")
@@ -546,6 +800,33 @@ def filter_by_reference_table(
         before_rows = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
         before_unique = con.execute(f"SELECT COUNT(DISTINCT {target_col}) FROM {t}").fetchone()[0]
 
+        if num_samples is not None and num_samples > 0:
+            removed_sample = con.execute(f"""
+                SELECT {target_col} AS {ref_col}
+                FROM {t}
+                WHERE {target_col} NOT IN (SELECT DISTINCT {ref_col} FROM {reference_table})
+                LIMIT {num_samples}
+            """).fetchdf()
+            if not removed_sample.empty:
+                logger.info(f"    제거 샘플 ({t}, 상위 {num_samples}개):\n{removed_sample.to_string()}")
+
+        if dry_run:
+            after_rows = con.execute(f"""
+                SELECT COUNT(*) FROM {t}
+                WHERE {target_col} IN (SELECT DISTINCT {ref_col} FROM {reference_table});
+            """).fetchone()[0]
+            after_unique = con.execute(f"""
+                SELECT COUNT(DISTINCT {target_col}) FROM {t}
+                WHERE {target_col} IN (SELECT DISTINCT {ref_col} FROM {reference_table});
+            """).fetchone()[0]
+
+            rows_removed = before_rows - after_rows
+            msno_removed = before_unique - after_unique
+
+            logger.info(f"    {before_rows:,} -> {after_rows:,} 행 ({rows_removed:,} 제거)")
+            logger.info(f"    {before_unique:,} -> {after_unique:,} 고유 msno ({msno_removed:,} 제거)")
+            continue
+
         # 기준 테이블의 msno만 남기기
         con.execute(f"""
             CREATE OR REPLACE TABLE {t}_filtered AS
@@ -582,6 +863,8 @@ def filter_by_churn_transition(
     target_tables: list[str],
     v1_churn_value: int = 0,
     v2_churn_values: list[int] = [0, 1],
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     train_v1과 train_v2의 is_churn 전이 조건을 만족하는 유저만 남깁니다.
@@ -594,12 +877,16 @@ def filter_by_churn_transition(
         target_tables: 필터링을 적용할 대상 테이블 이름 리스트 (_merge 테이블들)
         v1_churn_value: train_v1에서 필터링할 is_churn 값 (기본값: 0)
         v2_churn_values: train_v2에서 허용할 is_churn 값 리스트 (기본값: [0, 1])
+        num_samples: 샘플 출력 유저 수 (None이면 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
     """
     logger.info(f"=== Churn 전이 기반 필터링 시작 ===")
     logger.info(f"train_v1 테이블: {train_v1_table}")
     logger.info(f"train_v2 테이블: {train_v2_table}")
     logger.info(f"조건: v1.is_churn={v1_churn_value} AND v2.is_churn IN {v2_churn_values}")
     logger.info(f"대상 테이블: {target_tables}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     con = duckdb.connect(db_path)
     con.execute("PRAGMA threads=8;")
@@ -636,24 +923,35 @@ def filter_by_churn_transition(
 
     # 조건에 맞는 msno 추출
     v2_values_str = ", ".join([str(v) for v in v2_churn_values])
-
-    con.execute(f"""
-        CREATE OR REPLACE TABLE _churn_transition_msno_temp AS
+    eligible_subquery = f"""
         SELECT v1.{id_col}
         FROM {train_v1_table} v1
         INNER JOIN {train_v2_table} v2 ON v1.{id_col} = v2.{id_col}
         WHERE v1.is_churn = {v1_churn_value}
-          AND v2.is_churn IN ({v2_values_str});
-    """)
+          AND v2.is_churn IN ({v2_values_str})
+    """
 
-    filtered_count = con.execute("SELECT COUNT(*) FROM _churn_transition_msno_temp").fetchone()[0]
+    filtered_count = con.execute(f"""
+        SELECT COUNT(*) FROM (
+            {eligible_subquery}
+        ) t
+    """).fetchone()[0]
     logger.info(f"조건 만족 유저 수: {filtered_count:,}")
+
+    if num_samples is not None and num_samples > 0:
+        sample_users = con.execute(f"""
+            SELECT {id_col}
+            FROM ({eligible_subquery}) t
+            LIMIT {num_samples}
+        """).fetchdf()
+        if not sample_users.empty:
+            logger.info(f"샘플 유저 (상위 {num_samples}명):\n{sample_users.to_string()}")
 
     # is_churn 전이 분포 확인
     logger.info("선택된 유저의 v2 is_churn 분포:")
     dist = con.execute(f"""
         SELECT v2.is_churn, COUNT(*) as cnt
-        FROM _churn_transition_msno_temp t
+        FROM ({eligible_subquery}) t
         JOIN {train_v2_table} v2 ON t.{id_col} = v2.{id_col}
         GROUP BY v2.is_churn
         ORDER BY v2.is_churn
@@ -663,9 +961,52 @@ def filter_by_churn_transition(
 
     if filtered_count == 0:
         logger.error("조건을 만족하는 유저가 없습니다! 필터링을 중단합니다.")
-        con.execute("DROP TABLE IF EXISTS _churn_transition_msno_temp;")
         con.close()
         return
+
+    if dry_run:
+        for t in tqdm(target_tables, desc="Churn 전이 기반 필터링"):
+            if t not in existing_tables:
+                logger.warning(f"  {t}: 존재하지 않음, 건너뜀")
+                continue
+
+            target_cols = [row[0] for row in con.execute(f"DESCRIBE {t}").fetchall()]
+            if "msno" in target_cols:
+                target_col = "msno"
+            elif "user_id" in target_cols:
+                target_col = "user_id"
+            else:
+                logger.warning(f"  {t}: msno/user_id 컬럼 없음, 건너뜀")
+                continue
+
+            logger.info(f"  {t} 필터링 중...")
+
+            before_rows = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            before_unique = con.execute(f"SELECT COUNT(DISTINCT {target_col}) FROM {t}").fetchone()[0]
+
+            after_rows = con.execute(f"""
+                SELECT COUNT(*) FROM {t}
+                WHERE {target_col} IN ({eligible_subquery});
+            """).fetchone()[0]
+            after_unique = con.execute(f"""
+                SELECT COUNT(DISTINCT {target_col}) FROM {t}
+                WHERE {target_col} IN ({eligible_subquery});
+            """).fetchone()[0]
+
+            rows_removed = before_rows - after_rows
+            msno_removed = before_unique - after_unique
+
+            logger.info(f"    {before_rows:,} -> {after_rows:,} 행 ({rows_removed:,} 제거)")
+            logger.info(f"    {before_unique:,} -> {after_unique:,} 고유 유저 ({msno_removed:,} 제거)")
+
+        con.close()
+        logger.info(f"=== Churn 전이 기반 필터링 완료 ===\n")
+        return
+
+    con.execute(f"""
+        CREATE OR REPLACE TABLE _churn_transition_msno_temp AS
+        {eligible_subquery};
+    """)
 
     # 대상 테이블 필터링
     for t in tqdm(target_tables, desc="Churn 전이 기반 필터링"):
@@ -727,6 +1068,8 @@ def exclude_duplicate_transaction_users(
     target_tables: list[str],
     date_col: str = "transaction_date",
     min_txn_count: int = 2,
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     같은 날 비취소(is_cancel=0) 트랜잭션이 지정된 개수 이상인 유저를 제외합니다.
@@ -737,11 +1080,15 @@ def exclude_duplicate_transaction_users(
         target_tables: 필터링을 적용할 대상 테이블 이름 리스트
         date_col: 날짜 컬럼명 (기본값: transaction_date)
         min_txn_count: 제외 기준이 되는 최소 트랜잭션 수 (기본값: 2)
+        num_samples: 제외 샘플 출력 유저 수 (None이면 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
     """
     logger.info(f"=== 중복 트랜잭션 유저 제외 시작 ===")
     logger.info(f"트랜잭션 테이블: {transactions_table}")
     logger.info(f"제외 조건: 같은 날 비취소 트랜잭션 {min_txn_count}개 이상")
     logger.info(f"대상 테이블: {target_tables}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     con = duckdb.connect(db_path)
     con.execute("PRAGMA threads=8;")
@@ -771,9 +1118,7 @@ def exclude_duplicate_transaction_users(
     """).fetchone()[0]
     logger.info(f"트랜잭션 테이블 전체 유저 수: {total_users:,}")
 
-    # 중복 트랜잭션이 있는 유저 추출
-    con.execute(f"""
-        CREATE OR REPLACE TABLE _duplicate_txn_users_temp AS
+    dup_users_subquery = f"""
         WITH non_cancel_txns AS (
             SELECT * FROM {transactions_table} WHERE is_cancel = 0
         ),
@@ -783,17 +1128,74 @@ def exclude_duplicate_transaction_users(
             GROUP BY {id_col}, {date_col}
             HAVING COUNT(*) >= {min_txn_count}
         )
-        SELECT DISTINCT {id_col} FROM user_date_counts;
-    """)
+        SELECT DISTINCT {id_col} FROM user_date_counts
+    """
 
-    dup_user_count = con.execute("SELECT COUNT(*) FROM _duplicate_txn_users_temp").fetchone()[0]
+    dup_user_count = con.execute(f"""
+        SELECT COUNT(*) FROM (
+            {dup_users_subquery}
+        ) t
+    """).fetchone()[0]
     logger.info(f"중복 트랜잭션 유저 수: {dup_user_count:,} ({dup_user_count/total_users*100:.2f}%)")
+
+    if num_samples is not None and num_samples > 0:
+        sample_users = con.execute(f"""
+            SELECT {id_col}
+            FROM ({dup_users_subquery}) t
+            LIMIT {num_samples}
+        """).fetchdf()
+        if not sample_users.empty:
+            logger.info(f"제외 샘플 유저 (상위 {num_samples}명):\n{sample_users.to_string()}")
 
     if dup_user_count == 0:
         logger.info("제외할 유저가 없습니다.")
-        con.execute("DROP TABLE IF EXISTS _duplicate_txn_users_temp;")
         con.close()
         return
+
+    if dry_run:
+        for t in tqdm(target_tables, desc="중복 트랜잭션 유저 제외"):
+            if t not in existing_tables:
+                logger.warning(f"  {t}: 존재하지 않음, 건너뜀")
+                continue
+
+            target_cols = [row[0] for row in con.execute(f"DESCRIBE {t}").fetchall()]
+            if "user_id" in target_cols:
+                target_col = "user_id"
+            elif "msno" in target_cols:
+                target_col = "msno"
+            else:
+                logger.warning(f"  {t}: user_id/msno 컬럼 없음, 건너뜀")
+                continue
+
+            logger.info(f"  {t} 필터링 중...")
+
+            before_rows = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            before_unique = con.execute(f"SELECT COUNT(DISTINCT {target_col}) FROM {t}").fetchone()[0]
+
+            after_rows = con.execute(f"""
+                SELECT COUNT(*) FROM {t}
+                WHERE {target_col} NOT IN ({dup_users_subquery});
+            """).fetchone()[0]
+            after_unique = con.execute(f"""
+                SELECT COUNT(DISTINCT {target_col}) FROM {t}
+                WHERE {target_col} NOT IN ({dup_users_subquery});
+            """).fetchone()[0]
+
+            rows_removed = before_rows - after_rows
+            users_removed = before_unique - after_unique
+
+            logger.info(f"    {before_rows:,} -> {after_rows:,} 행 ({rows_removed:,} 제거)")
+            logger.info(f"    {before_unique:,} -> {after_unique:,} 고유 유저 ({users_removed:,} 제거)")
+
+        con.close()
+        logger.info(f"=== 중복 트랜잭션 유저 제외 완료 ===\n")
+        return
+
+    # 중복 트랜잭션이 있는 유저 추출
+    con.execute(f"""
+        CREATE OR REPLACE TABLE _duplicate_txn_users_temp AS
+        {dup_users_subquery};
+    """)
 
     # 대상 테이블에서 중복 유저 제외
     for t in tqdm(target_tables, desc="중복 트랜잭션 유저 제외"):
@@ -850,6 +1252,8 @@ def exclude_null_total_secs_users(
     db_path: str,
     logs_table: str = "user_logs_merge",
     target_tables: list[str] = None,
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     user_logs_merge에서 total_secs가 NULL인 유저를 모든 _merge 테이블에서 제외합니다.
@@ -859,6 +1263,8 @@ def exclude_null_total_secs_users(
         logs_table: 로그 테이블 이름 (기본값: user_logs_merge)
         target_tables: 필터링을 적용할 대상 테이블 이름 리스트
                        기본값: ["train_merge", "transactions_merge", "user_logs_merge", "members_merge"]
+        num_samples: 제외 샘플 출력 유저 수 (None이면 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
     """
     if target_tables is None:
         target_tables = ["train_merge", "transactions_merge", "user_logs_merge", "members_merge"]
@@ -866,6 +1272,8 @@ def exclude_null_total_secs_users(
     logger.info(f"=== NULL total_secs 유저 제외 시작 ===")
     logger.info(f"로그 테이블: {logs_table}")
     logger.info(f"대상 테이블: {target_tables}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     con = duckdb.connect(db_path)
     con.execute("PRAGMA threads=8;")
@@ -895,22 +1303,77 @@ def exclude_null_total_secs_users(
     """).fetchone()[0]
     logger.info(f"로그 테이블 전체 유저 수: {total_users:,}")
 
-    # NULL total_secs가 있는 유저 추출
-    con.execute(f"""
-        CREATE OR REPLACE TABLE _null_total_secs_users_temp AS
+    null_users_subquery = f"""
         SELECT DISTINCT {id_col}
         FROM {logs_table}
-        WHERE total_secs IS NULL;
-    """)
+        WHERE total_secs IS NULL
+    """
 
-    null_user_count = con.execute("SELECT COUNT(*) FROM _null_total_secs_users_temp").fetchone()[0]
+    null_user_count = con.execute(f"""
+        SELECT COUNT(*) FROM (
+            {null_users_subquery}
+        ) t
+    """).fetchone()[0]
     logger.info(f"NULL total_secs 유저 수: {null_user_count:,} ({null_user_count/total_users*100:.2f}%)")
+
+    if num_samples is not None and num_samples > 0:
+        sample_users = con.execute(f"""
+            SELECT {id_col}
+            FROM ({null_users_subquery}) t
+            LIMIT {num_samples}
+        """).fetchdf()
+        if not sample_users.empty:
+            logger.info(f"제외 샘플 유저 (상위 {num_samples}명):\n{sample_users.to_string()}")
 
     if null_user_count == 0:
         logger.info("제외할 유저가 없습니다.")
-        con.execute("DROP TABLE IF EXISTS _null_total_secs_users_temp;")
         con.close()
         return
+
+    if dry_run:
+        for t in tqdm(target_tables, desc="NULL total_secs 유저 제외"):
+            if t not in existing_tables:
+                logger.warning(f"  {t}: 존재하지 않음, 건너뜀")
+                continue
+
+            target_cols = [row[0] for row in con.execute(f"DESCRIBE {t}").fetchall()]
+            if "user_id" in target_cols:
+                target_col = "user_id"
+            elif "msno" in target_cols:
+                target_col = "msno"
+            else:
+                logger.warning(f"  {t}: user_id/msno 컬럼 없음, 건너뜀")
+                continue
+
+            logger.info(f"  {t} 필터링 중...")
+
+            before_rows = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            before_unique = con.execute(f"SELECT COUNT(DISTINCT {target_col}) FROM {t}").fetchone()[0]
+
+            after_rows = con.execute(f"""
+                SELECT COUNT(*) FROM {t}
+                WHERE {target_col} NOT IN ({null_users_subquery});
+            """).fetchone()[0]
+            after_unique = con.execute(f"""
+                SELECT COUNT(DISTINCT {target_col}) FROM {t}
+                WHERE {target_col} NOT IN ({null_users_subquery});
+            """).fetchone()[0]
+
+            rows_removed = before_rows - after_rows
+            users_removed = before_unique - after_unique
+
+            logger.info(f"    {before_rows:,} -> {after_rows:,} 행 ({rows_removed:,} 제거)")
+            logger.info(f"    {before_unique:,} -> {after_unique:,} 고유 유저 ({users_removed:,} 제거)")
+
+        con.close()
+        logger.info(f"=== NULL total_secs 유저 제외 완료 ===\n")
+        return
+
+    # NULL total_secs가 있는 유저 추출
+    con.execute(f"""
+        CREATE OR REPLACE TABLE _null_total_secs_users_temp AS
+        {null_users_subquery};
+    """)
 
     # 대상 테이블에서 NULL 유저 제외
     for t in tqdm(target_tables, desc="NULL total_secs 유저 제외"):
@@ -966,6 +1429,8 @@ def exclude_null_total_secs_users(
 def analyze_plan_days_30_31_users(
     db_path: str,
     transactions_table: str = "transactions_merge",
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     plan_days가 30, 31인 트랜잭션만 가진 유저 수를 분석합니다.
@@ -973,9 +1438,13 @@ def analyze_plan_days_30_31_users(
     Args:
         db_path: DuckDB 데이터베이스 경로
         transactions_table: 트랜잭션 테이블 이름 (기본값: transactions_merge)
+        num_samples: 샘플 출력 유저 수 (None이면 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
     """
     logger.info(f"=== plan_days 30/31 유저 분석 시작 ===")
     logger.info(f"트랜잭션 테이블: {transactions_table}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     con = duckdb.connect(db_path)
     con.execute("PRAGMA threads=8;")
@@ -1033,6 +1502,34 @@ def analyze_plan_days_30_31_users(
     for category, count in plan_days_dist:
         logger.info(f"  {category}: {count:,} ({count/total_users*100:.2f}%)")
 
+    if num_samples is not None and num_samples > 0:
+        sample_users = con.execute(f"""
+            WITH user_plan_days AS (
+                SELECT user_id, ARRAY_AGG(DISTINCT payment_plan_days ORDER BY payment_plan_days) AS plan_days_list
+                FROM {transactions_table}
+                GROUP BY user_id
+            ),
+            categorized AS (
+                SELECT
+                    user_id,
+                    plan_days_list,
+                    CASE
+                        WHEN plan_days_list = [30] THEN 'only_30'
+                        WHEN plan_days_list = [31] THEN 'only_31'
+                        WHEN plan_days_list = [30, 31] THEN 'both_30_31'
+                        ELSE 'other'
+                    END AS category
+                FROM user_plan_days
+            )
+            SELECT user_id, plan_days_list, category
+            FROM categorized
+            WHERE category IN ('only_30', 'only_31', 'both_30_31')
+            ORDER BY category, user_id
+            LIMIT {num_samples}
+        """).fetchdf()
+        if not sample_users.empty:
+            logger.info(f"샘플 유저 (상위 {num_samples}명):\n{sample_users.to_string()}")
+
     con.close()
     logger.info(f"=== plan_days 30/31 유저 분석 완료 ===\n")
 
@@ -1043,6 +1540,8 @@ def exclude_out_of_range_expire_date_users(
     target_tables: list[str] = None,
     min_year: int = 2015,
     max_year: int = 2017,
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     membership_expire_date가 지정된 연도 범위를 벗어나는 유저를 모든 _merge 테이블에서 제외합니다.
@@ -1054,6 +1553,8 @@ def exclude_out_of_range_expire_date_users(
                        기본값: ["train_merge", "transactions_merge", "user_logs_merge", "members_merge"]
         min_year: 최소 연도 (포함, 기본값: 2015)
         max_year: 최대 연도 (포함, 기본값: 2017)
+        num_samples: 제외 샘플 출력 유저 수 (None이면 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
     """
     if target_tables is None:
         target_tables = ["train_merge", "transactions_merge", "user_logs_merge", "members_merge"]
@@ -1062,6 +1563,8 @@ def exclude_out_of_range_expire_date_users(
     logger.info(f"트랜잭션 테이블: {transactions_table}")
     logger.info(f"연도 범위: [{min_year}, {max_year}]")
     logger.info(f"대상 테이블: {target_tables}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     con = duckdb.connect(db_path)
     con.execute("PRAGMA threads=8;")
@@ -1091,23 +1594,78 @@ def exclude_out_of_range_expire_date_users(
     """).fetchone()[0]
     logger.info(f"트랜잭션 테이블 전체 유저 수: {total_users:,}")
 
-    # 범위 밖 membership_expire_date를 가진 유저 추출
-    con.execute(f"""
-        CREATE OR REPLACE TABLE _out_of_range_expire_users_temp AS
+    out_of_range_subquery = f"""
         SELECT DISTINCT {id_col}
         FROM {transactions_table}
         WHERE YEAR(membership_expire_date) < {min_year}
-           OR YEAR(membership_expire_date) > {max_year};
-    """)
+           OR YEAR(membership_expire_date) > {max_year}
+    """
 
-    out_of_range_count = con.execute("SELECT COUNT(*) FROM _out_of_range_expire_users_temp").fetchone()[0]
+    out_of_range_count = con.execute(f"""
+        SELECT COUNT(*) FROM (
+            {out_of_range_subquery}
+        ) t
+    """).fetchone()[0]
     logger.info(f"범위 밖 유저 수: {out_of_range_count:,} ({out_of_range_count/total_users*100:.2f}%)")
+
+    if num_samples is not None and num_samples > 0:
+        sample_users = con.execute(f"""
+            SELECT {id_col}
+            FROM ({out_of_range_subquery}) t
+            LIMIT {num_samples}
+        """).fetchdf()
+        if not sample_users.empty:
+            logger.info(f"제외 샘플 유저 (상위 {num_samples}명):\n{sample_users.to_string()}")
 
     if out_of_range_count == 0:
         logger.info("제외할 유저가 없습니다.")
-        con.execute("DROP TABLE IF EXISTS _out_of_range_expire_users_temp;")
         con.close()
         return
+
+    if dry_run:
+        for t in tqdm(target_tables, desc="범위 밖 expire_date 유저 제외"):
+            if t not in existing_tables:
+                logger.warning(f"  {t}: 존재하지 않음, 건너뜀")
+                continue
+
+            target_cols = [row[0] for row in con.execute(f"DESCRIBE {t}").fetchall()]
+            if "user_id" in target_cols:
+                target_col = "user_id"
+            elif "msno" in target_cols:
+                target_col = "msno"
+            else:
+                logger.warning(f"  {t}: user_id/msno 컬럼 없음, 건너뜀")
+                continue
+
+            logger.info(f"  {t} 필터링 중...")
+
+            before_rows = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            before_unique = con.execute(f"SELECT COUNT(DISTINCT {target_col}) FROM {t}").fetchone()[0]
+
+            after_rows = con.execute(f"""
+                SELECT COUNT(*) FROM {t}
+                WHERE {target_col} NOT IN ({out_of_range_subquery});
+            """).fetchone()[0]
+            after_unique = con.execute(f"""
+                SELECT COUNT(DISTINCT {target_col}) FROM {t}
+                WHERE {target_col} NOT IN ({out_of_range_subquery});
+            """).fetchone()[0]
+
+            rows_removed = before_rows - after_rows
+            users_removed = before_unique - after_unique
+
+            logger.info(f"    {before_rows:,} -> {after_rows:,} 행 ({rows_removed:,} 제거)")
+            logger.info(f"    {before_unique:,} -> {after_unique:,} 고유 유저 ({users_removed:,} 제거)")
+
+        con.close()
+        logger.info(f"=== membership_expire_date 범위 밖 유저 제외 완료 ===\n")
+        return
+
+    # 범위 밖 membership_expire_date를 가진 유저 추출
+    con.execute(f"""
+        CREATE OR REPLACE TABLE _out_of_range_expire_users_temp AS
+        {out_of_range_subquery};
+    """)
 
     # 대상 테이블에서 범위 밖 유저 제외
     for t in tqdm(target_tables, desc="범위 밖 expire_date 유저 제외"):
@@ -1169,6 +1727,8 @@ def analyze_churn_transition(
     train_v2_table: str,
     output_dir: str,
     reference_table: str = None,
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     train_v1과 train_v2의 is_churn 전이행렬을 분석하고 히트맵을 저장합니다.
@@ -1179,6 +1739,8 @@ def analyze_churn_transition(
         train_v2_table: train v2 테이블 이름
         output_dir: 히트맵 이미지 저장 디렉토리
         reference_table: 기준 테이블 (지정 시 해당 테이블에 있는 유저만 분석)
+        num_samples: 샘플 출력 유저 수 (None이면 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
     """
     import matplotlib.pyplot as plt
     import seaborn as sns
@@ -1189,6 +1751,8 @@ def analyze_churn_transition(
     logger.info(f"train_v2: {train_v2_table}")
     if reference_table:
         logger.info(f"기준 테이블: {reference_table}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     con = duckdb.connect(db_path, read_only=True)
 
@@ -1238,6 +1802,21 @@ def analyze_churn_transition(
     logger.info(f"전이행렬 데이터 (3x3):")
     for _, row in transition_df.iterrows():
         logger.info(f"  v1={row['v1_churn']} -> v2={row['v2_churn']}: {row['cnt']:,}")
+
+    if num_samples is not None and num_samples > 0:
+        sample_cases = con.execute(f"""
+            SELECT
+                COALESCE(v1.{id_col}, v2.{id_col}) AS user_id,
+                v1.is_churn AS v1_churn,
+                v2.is_churn AS v2_churn
+            FROM {train_v1_table} v1
+            FULL OUTER JOIN {train_v2_table} v2 ON v1.{id_col} = v2.{id_col}
+            WHERE 1=1 {ref_condition}
+            ORDER BY user_id
+            LIMIT {num_samples}
+        """).fetchdf()
+        if not sample_cases.empty:
+            logger.info(f"샘플 전이 케이스 (상위 {num_samples}개):\n{sample_cases.to_string()}")
 
     # Pivot table 생성 (3x3 고정)
     pivot_df = transition_df.pivot(index='v1_churn', columns='v2_churn', values='cnt').fillna(0).astype(int)
@@ -1302,6 +1881,8 @@ def analyze_duplicate_transactions(
     date_col: str = "transaction_date",
     min_txn_count: int = 2,
     reference_table: str = None,
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     같은 날 비취소 트랜잭션이 지정된 개수 이상인 유저를 분석하고 결과를 저장합니다.
@@ -1313,6 +1894,8 @@ def analyze_duplicate_transactions(
         date_col: 날짜 컬럼명 (기본값: transaction_date)
         min_txn_count: 중복으로 간주할 최소 트랜잭션 수 (기본값: 2)
         reference_table: 기준 테이블 (지정 시 해당 테이블에 있는 유저만 분석)
+        num_samples: 샘플 출력 케이스 수 (None이면 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
     """
     import matplotlib.pyplot as plt
 
@@ -1321,6 +1904,8 @@ def analyze_duplicate_transactions(
     logger.info(f"중복 기준: 같은 날 비취소 트랜잭션 {min_txn_count}개 이상")
     if reference_table:
         logger.info(f"기준 테이블: {reference_table}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     con = duckdb.connect(db_path, read_only=True)
 
@@ -1383,6 +1968,26 @@ def analyze_duplicate_transactions(
     logger.info(f"중복 유저-날짜 쌍 수: {dup_pair_count:,}")
     logger.info(f"중복 트랜잭션 총 수: {dup_txn_count:,}")
     logger.info(f"정상 유저 수: {clean_users:,}")
+
+    if num_samples is not None and num_samples > 0:
+        sample_pairs = con.execute(f"""
+            WITH non_cancel_txns AS (
+                SELECT * FROM {transactions_table}
+                WHERE is_cancel = 0 {ref_condition}
+            ),
+            user_date_counts AS (
+                SELECT {id_col}, {date_col}, COUNT(*) as txn_count
+                FROM non_cancel_txns
+                GROUP BY {id_col}, {date_col}
+                HAVING COUNT(*) >= {min_txn_count}
+            )
+            SELECT {id_col}, {date_col}, txn_count
+            FROM user_date_counts
+            ORDER BY txn_count DESC
+            LIMIT {num_samples}
+        """).fetchdf()
+        if not sample_pairs.empty:
+            logger.info(f"샘플 중복 케이스 (상위 {num_samples}개):\n{sample_pairs.to_string()}")
 
     # 중복 트랜잭션 개수별 분포
     txn_count_dist = con.execute(f"""
@@ -1457,6 +2062,8 @@ def analyze_duplicate_transactions(
 def convert_gender_to_int(
     db_path: str,
     table_name: str,
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     지정된 테이블의 gender 필드를 정수로 변환합니다.
@@ -1465,9 +2072,13 @@ def convert_gender_to_int(
     Args:
         db_path: DuckDB 데이터베이스 경로
         table_name: 대상 테이블 이름
+        num_samples: 샘플 출력 행 수 (None이면 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
     """
     logger.info(f"=== gender 필드 정수 변환 시작 ===")
     logger.info(f"대상 테이블: {table_name}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     con = duckdb.connect(db_path)
 
@@ -1494,6 +2105,39 @@ def convert_gender_to_int(
         ORDER BY gender
     """).fetchdf()
     logger.info(f"\n{before_dist.to_string()}")
+
+    if dry_run:
+        logger.info("DRY RUN: gender 변환을 적용하지 않고 결과 분포만 계산합니다.")
+        after_dist = con.execute(f"""
+            SELECT
+                CASE
+                    WHEN gender IS NULL THEN -1
+                    WHEN gender = 'male' THEN 0
+                    WHEN gender = 'female' THEN 1
+                    ELSE -1
+                END AS gender,
+                COUNT(*) AS cnt
+            FROM {table_name}
+            GROUP BY gender
+            ORDER BY gender
+        """).fetchdf()
+        logger.info(f"변환 후 gender 분포 (dry_run):")
+        logger.info(f"\n{after_dist.to_string()}")
+
+        if num_samples is not None and num_samples > 0:
+            id_col = "user_id" if "user_id" in cols else "msno" if "msno" in cols else None
+            select_cols = [id_col] if id_col else []
+            select_cols.append("CASE WHEN gender IS NULL THEN -1 WHEN gender = 'male' THEN 0 WHEN gender = 'female' THEN 1 ELSE -1 END AS gender")
+            sample = con.execute(f"""
+                SELECT {', '.join(select_cols)}
+                FROM {table_name}
+                LIMIT {num_samples}
+            """).fetchdf()
+            logger.info(f"샘플 데이터 (상위 {num_samples}개, dry_run):\n{sample.to_string()}")
+
+        con.close()
+        logger.info(f"=== gender 필드 정수 변환 완료 ===\n")
+        return
 
     # gender 변환
     con.execute(f"""
@@ -1522,6 +2166,16 @@ def convert_gender_to_int(
     """).fetchdf()
     logger.info(f"\n{after_dist.to_string()}")
 
+    if num_samples is not None and num_samples > 0:
+        id_col = "user_id" if "user_id" in cols else "msno" if "msno" in cols else None
+        select_cols = [id_col, "gender"] if id_col else ["gender"]
+        sample = con.execute(f"""
+            SELECT {', '.join(select_cols)}
+            FROM {table_name}
+            LIMIT {num_samples}
+        """).fetchdf()
+        logger.info(f"샘플 데이터 (상위 {num_samples}개):\n{sample.to_string()}")
+
     con.close()
     logger.info(f"=== gender 필드 정수 변환 완료 ===\n")
 
@@ -1539,6 +2193,8 @@ def convert_date_fields(
         "registration_init_time",
         "expiration_date",
     ],
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     지정된 테이블들의 YYYYmmdd 형식 날짜 필드를 DATE 타입으로 변환합니다.
@@ -1547,10 +2203,14 @@ def convert_date_fields(
         db_path: DuckDB 데이터베이스 경로
         target_tables: 변환을 적용할 테이블 이름 리스트
         date_field_patterns: 날짜로 변환할 컬럼명 패턴 리스트
+        num_samples: 샘플 출력 행 수 (None이면 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
     """
     logger.info(f"=== 날짜 필드 변환 시작 ===")
     logger.info(f"대상 테이블: {target_tables}")
     logger.info(f"날짜 필드 패턴: {date_field_patterns}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     con = duckdb.connect(db_path)
     con.execute("PRAGMA threads=8;")
@@ -1593,6 +2253,33 @@ def convert_date_fields(
                         sample_val = str(sample[0])
                         # YYYYmmdd 형식 확인 (8자리 숫자)
                         if len(sample_val) == 8 and sample_val.isdigit():
+                            if dry_run:
+                                logger.info(f"  {table}.{col_name}: DRY RUN - 변환 예상")
+                                conversion_expr = f"""
+                                    CASE
+                                        WHEN {col_name} IS NULL OR {col_name} = 0 THEN NULL
+                                        ELSE STRPTIME(CAST({col_name} AS VARCHAR), '%Y%m%d')::DATE
+                                    END
+                                """
+                                stats = con.execute(f"""
+                                    SELECT
+                                        MIN({conversion_expr}) as min_date,
+                                        MAX({conversion_expr}) as max_date,
+                                        COUNT(*) as total,
+                                        SUM(CASE WHEN {conversion_expr} IS NULL THEN 1 ELSE 0 END) as null_count
+                                    FROM {table}
+                                """).fetchone()
+                                logger.info(f"    {col_name}: 범위 {stats[0]} ~ {stats[1]}, NULL: {stats[3]:,}/{stats[2]:,}")
+                                if num_samples is not None and num_samples > 0:
+                                    sample = con.execute(f"""
+                                        SELECT {conversion_expr} AS {col_name}
+                                        FROM {table}
+                                        WHERE {col_name} IS NOT NULL AND {col_name} != 0
+                                        LIMIT {num_samples}
+                                    """).fetchdf()
+                                    if not sample.empty:
+                                        logger.info(f"    {table}.{col_name} 샘플 (상위 {num_samples}개, dry_run):\n{sample.to_string()}")
+                                continue
                             con.execute(f"""
                                 ALTER TABLE {table}
                                 ALTER COLUMN {col_name}
@@ -1623,6 +2310,17 @@ def convert_date_fields(
                 except Exception as e:
                     logger.error(f"    {col} 통계 조회 실패: {e}")
 
+            if num_samples is not None and num_samples > 0:
+                for col in converted_cols:
+                    sample = con.execute(f"""
+                        SELECT {col}
+                        FROM {table}
+                        WHERE {col} IS NOT NULL
+                        LIMIT {num_samples}
+                    """).fetchdf()
+                    if not sample.empty:
+                        logger.info(f"    {table}.{col} 샘플 (상위 {num_samples}개):\n{sample.to_string()}")
+
     con.close()
     logger.info(f"=== 날짜 필드 변환 완료 ===\n")
 
@@ -1633,6 +2331,8 @@ def convert_date_fields(
 def rename_msno_to_user_id(
     db_path: str,
     target_tables: list[str],
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     지정된 테이블들의 msno 컬럼명을 user_id로 변경합니다.
@@ -1640,9 +2340,13 @@ def rename_msno_to_user_id(
     Args:
         db_path: DuckDB 데이터베이스 경로
         target_tables: 컬럼명을 변경할 테이블 이름 리스트
+        num_samples: 샘플 출력 행 수 (None이면 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
     """
     logger.info(f"=== msno -> user_id 컬럼명 변경 시작 ===")
     logger.info(f"대상 테이블: {target_tables}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     con = duckdb.connect(db_path)
 
@@ -1656,10 +2360,28 @@ def rename_msno_to_user_id(
         cols = [row[0] for row in con.execute(f"DESCRIBE {table}").fetchall()]
 
         if "msno" in cols:
-            con.execute(f"ALTER TABLE {table} RENAME COLUMN msno TO user_id;")
-            logger.info(f"  {table}: msno -> user_id 변경 완료")
+            if dry_run:
+                logger.info(f"  {table}: msno -> user_id 변경 예정 (dry_run)")
+            else:
+                con.execute(f"ALTER TABLE {table} RENAME COLUMN msno TO user_id;")
+                logger.info(f"  {table}: msno -> user_id 변경 완료")
+            if num_samples is not None and num_samples > 0:
+                sample_col = "msno" if dry_run else "user_id"
+                sample = con.execute(f"""
+                    SELECT {sample_col}
+                    FROM {table}
+                    LIMIT {num_samples}
+                """).fetchdf()
+                logger.info(f"  {table} 샘플 (상위 {num_samples}개):\n{sample.to_string()}")
         elif "user_id" in cols:
             logger.info(f"  {table}: 이미 user_id 존재")
+            if num_samples is not None and num_samples > 0:
+                sample = con.execute(f"""
+                    SELECT user_id
+                    FROM {table}
+                    LIMIT {num_samples}
+                """).fetchdf()
+                logger.info(f"  {table} 샘플 (상위 {num_samples}개):\n{sample.to_string()}")
         else:
             logger.warning(f"  {table}: msno/user_id 컬럼 없음")
 
@@ -1676,6 +2398,8 @@ def create_transactions_seq(
     target_table: str = "transactions_seq",
     gap_days: int = 30,
     cutoff_date: str = "2017-03-31",
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     트랜잭션 시퀀스 테이블을 생성합니다.
@@ -1689,6 +2413,8 @@ def create_transactions_seq(
         target_table: 생성할 시퀀스 테이블명 (기본값: transactions_seq)
         gap_days: 시퀀스 연결 기준 일수 (기본값: 30)
         cutoff_date: 데이터 범위 마지막 날짜 (기본값: 2017-03-31)
+        num_samples: 샘플 출력 행 수 (None이면 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
 
     생성되는 컬럼:
         - sequence_group_id: 유저 내 시퀀스 그룹 ID (0, 1, ...)
@@ -1702,6 +2428,8 @@ def create_transactions_seq(
     logger.info(f"대상 테이블: {target_table}")
     logger.info(f"시퀀스 연결 기준: {gap_days}일")
     logger.info(f"데이터 cutoff: {cutoff_date}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     con = duckdb.connect(db_path)
     con.execute("PRAGMA threads=8;")
@@ -1716,12 +2444,7 @@ def create_transactions_seq(
     # 원본 테이블 정보
     source_count = con.execute(f"SELECT COUNT(*) FROM {source_table}").fetchone()[0]
     logger.info(f"원본 테이블 행 수: {source_count:,}")
-
-    # SQL 기반으로 시퀀스 테이블 생성 (Window 함수 활용)
-    logger.info(f"SQL 기반 시퀀스 계산 중...")
-
-    con.execute(f"""
-        CREATE OR REPLACE TABLE {target_table} AS
+    sequence_query = f"""
         WITH ordered_txn AS (
             -- Step 1: 정렬 및 이전 행 정보 가져오기
             SELECT
@@ -1840,6 +2563,64 @@ def create_transactions_seq(
             FROM with_group_info
         )
         SELECT * FROM final
+    """
+
+    if dry_run:
+        result_count = con.execute(f"""
+            SELECT COUNT(*) FROM (
+                {sequence_query}
+            ) t
+        """).fetchone()[0]
+        unique_users = con.execute(f"""
+            SELECT COUNT(DISTINCT user_id) FROM (
+                {sequence_query}
+            ) t
+        """).fetchone()[0]
+
+        churn_stats = con.execute(f"""
+            SELECT is_churn, COUNT(*) as cnt
+            FROM (
+                {sequence_query}
+            ) t
+            GROUP BY is_churn
+            ORDER BY is_churn
+        """).fetchall()
+
+        logger.info(f"생성 예정: {result_count:,} 행, {unique_users:,} 유저")
+        logger.info(f"is_churn 분포:")
+        for churn_val, cnt in churn_stats:
+            logger.info(f"  {churn_val}: {cnt:,}")
+
+        if num_samples is not None and num_samples > 0:
+            sample = con.execute(f"""
+                WITH seq AS (
+                    {sequence_query}
+                )
+                SELECT user_id, transaction_date, membership_expire_date,
+                       sequence_group_id, sequence_id,
+                       before_transaction_term, before_membership_expire_term, is_churn
+                FROM seq
+                WHERE user_id = (
+                    SELECT user_id FROM seq
+                    GROUP BY user_id
+                    HAVING COUNT(DISTINCT sequence_group_id) >= 2
+                    LIMIT 1
+                )
+                ORDER BY transaction_date
+                LIMIT {num_samples}
+            """).fetchdf()
+            logger.info(f"샘플 데이터 (시퀀스 그룹 2개 이상 유저, 상위 {num_samples}개):\n{sample.to_string()}")
+
+        con.close()
+        logger.info(f"=== 트랜잭션 시퀀스 테이블 생성 완료 ===\n")
+        return
+
+    # SQL 기반으로 시퀀스 테이블 생성 (Window 함수 활용)
+    logger.info(f"SQL 기반 시퀀스 계산 중...")
+
+    con.execute(f"""
+        CREATE OR REPLACE TABLE {target_table} AS
+        {sequence_query}
         ORDER BY user_id, transaction_date, membership_expire_date;
     """)
 
@@ -1860,22 +2641,22 @@ def create_transactions_seq(
     for churn_val, cnt in churn_stats:
         logger.info(f"  {churn_val}: {cnt:,}")
 
-    # 샘플 데이터 출력
-    sample = con.execute(f"""
-        SELECT user_id, transaction_date, membership_expire_date,
-               sequence_group_id, sequence_id,
-               before_transaction_term, before_membership_expire_term, is_churn
-        FROM {target_table}
-        WHERE user_id = (
-            SELECT user_id FROM {target_table}
-            GROUP BY user_id
-            HAVING COUNT(DISTINCT sequence_group_id) >= 2
-            LIMIT 1
-        )
-        ORDER BY transaction_date
-        LIMIT 15
-    """).fetchdf()
-    logger.info(f"샘플 데이터 (시퀀스 그룹 2개 이상 유저):\n{sample.to_string()}")
+    if num_samples is not None and num_samples > 0:
+        sample = con.execute(f"""
+            SELECT user_id, transaction_date, membership_expire_date,
+                   sequence_group_id, sequence_id,
+                   before_transaction_term, before_membership_expire_term, is_churn
+            FROM {target_table}
+            WHERE user_id = (
+                SELECT user_id FROM {target_table}
+                GROUP BY user_id
+                HAVING COUNT(DISTINCT sequence_group_id) >= 2
+                LIMIT 1
+            )
+            ORDER BY transaction_date
+            LIMIT {num_samples}
+        """).fetchdf()
+        logger.info(f"샘플 데이터 (시퀀스 그룹 2개 이상 유저, 상위 {num_samples}개):\n{sample.to_string()}")
 
     con.close()
     logger.info(f"=== 트랜잭션 시퀀스 테이블 생성 완료 ===\n")
@@ -1887,6 +2668,8 @@ def create_transactions_seq(
 def add_actual_plan_days(
     db_path: str,
     seq_table: str = "transactions_seq",
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     transactions_seq 테이블에 actual_plan_days 컬럼을 추가합니다.
@@ -1906,8 +2689,12 @@ def add_actual_plan_days(
     Args:
         db_path: DuckDB 데이터베이스 경로
         seq_table: 트랜잭션 시퀀스 테이블명 (기본값: transactions_seq)
+        num_samples: 샘플 출력 행 수 (None이면 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
     """
     logger.info(f"=== {seq_table}에 actual_plan_days 추가 시작 ===")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     con = duckdb.connect(db_path)
     con.execute("PRAGMA threads=8;")
@@ -1923,10 +2710,76 @@ def add_actual_plan_days(
     columns = [row[0] for row in con.execute(f"DESCRIBE {seq_table}").fetchall()]
     if "actual_plan_days" in columns:
         logger.info("actual_plan_days 컬럼이 이미 존재합니다. 재계산합니다.")
-        con.execute(f"ALTER TABLE {seq_table} DROP COLUMN actual_plan_days")
+        if dry_run:
+            logger.info("DRY RUN: 기존 actual_plan_days 컬럼 삭제는 생략합니다.")
+        else:
+            con.execute(f"ALTER TABLE {seq_table} DROP COLUMN actual_plan_days")
 
     # actual_plan_days 계산 및 추가
     logger.info("actual_plan_days 계산 중...")
+
+    if dry_run:
+        calc_query = f"""
+            WITH with_prev_expire AS (
+                SELECT
+                    *,
+                    LAG(membership_expire_date) OVER (
+                        PARTITION BY user_id
+                        ORDER BY transaction_date, membership_expire_date
+                    ) AS prev_expire_date
+                FROM {seq_table}
+            )
+            SELECT
+                *,
+                CAST(
+                    CASE
+                        WHEN prev_expire_date IS NULL THEN
+                            membership_expire_date - transaction_date
+                        WHEN transaction_date > prev_expire_date THEN
+                            membership_expire_date - transaction_date
+                        ELSE
+                            membership_expire_date - prev_expire_date
+                    END AS BIGINT
+                ) AS actual_plan_days
+            FROM with_prev_expire
+        """
+
+        stats = con.execute(f"""
+            SELECT
+                COUNT(*) AS total_rows,
+                AVG(actual_plan_days) AS avg_actual,
+                AVG(payment_plan_days) AS avg_payment,
+                SUM(CASE WHEN actual_plan_days != payment_plan_days THEN 1 ELSE 0 END) AS diff_count,
+                MIN(actual_plan_days) AS min_actual,
+                MAX(actual_plan_days) AS max_actual
+            FROM ({calc_query}) t
+        """).fetchone()
+
+        logger.info(f"추가 예정: {stats[0]:,} 행")
+        logger.info(f"actual_plan_days 통계:")
+        logger.info(f"  평균: {stats[1]:.1f}일 (payment_plan_days 평균: {stats[2]:.1f}일)")
+        logger.info(f"  범위: [{stats[4]}, {stats[5]}]일")
+        logger.info(f"  payment_plan_days와 다른 행: {stats[3]:,} ({100*stats[3]/stats[0]:.1f}%)")
+
+        if num_samples is not None and num_samples > 0:
+            diff_sample = con.execute(f"""
+                SELECT
+                    user_id,
+                    transaction_date,
+                    payment_plan_days,
+                    actual_plan_days,
+                    actual_plan_days - payment_plan_days AS diff
+                FROM ({calc_query}) t
+                WHERE actual_plan_days != payment_plan_days
+                ORDER BY ABS(actual_plan_days - payment_plan_days) DESC
+                LIMIT {num_samples}
+            """).fetchdf()
+            if len(diff_sample) > 0:
+                logger.info(f"차이 케이스 샘플 (상위 {num_samples}개):\n{diff_sample.to_string()}")
+
+        con.close()
+        logger.info(f"=== {seq_table}에 actual_plan_days 추가 완료 ===\n")
+        return
 
     con.execute(f"""
         -- 임시 테이블에 actual_plan_days 계산
@@ -2004,21 +2857,21 @@ def add_actual_plan_days(
     logger.info(f"  범위: [{stats[4]}, {stats[5]}]일")
     logger.info(f"  payment_plan_days와 다른 행: {stats[3]:,} ({100*stats[3]/stats[0]:.1f}%)")
 
-    # 차이 분포 샘플
-    diff_sample = con.execute(f"""
-        SELECT
-            payment_plan_days,
-            actual_plan_days,
-            actual_plan_days - payment_plan_days AS diff,
-            COUNT(*) AS cnt
-        FROM {seq_table}
-        WHERE actual_plan_days != payment_plan_days
-        GROUP BY payment_plan_days, actual_plan_days
-        ORDER BY cnt DESC
-        LIMIT 10
-    """).fetchdf()
-    if len(diff_sample) > 0:
-        logger.info(f"차이 분포 (상위 10개):\n{diff_sample.to_string()}")
+    if num_samples is not None and num_samples > 0:
+        diff_sample = con.execute(f"""
+            SELECT
+                user_id,
+                transaction_date,
+                payment_plan_days,
+                actual_plan_days,
+                actual_plan_days - payment_plan_days AS diff
+            FROM {seq_table}
+            WHERE actual_plan_days != payment_plan_days
+            ORDER BY ABS(actual_plan_days - payment_plan_days) DESC
+            LIMIT {num_samples}
+        """).fetchdf()
+        if len(diff_sample) > 0:
+            logger.info(f"차이 케이스 샘플 (상위 {num_samples}개):\n{diff_sample.to_string()}")
 
     con.close()
     logger.info(f"=== {seq_table}에 actual_plan_days 추가 완료 ===\n")
@@ -2031,6 +2884,8 @@ def analyze_actual_plan_days(
     db_path: str,
     seq_table: str = "transactions_seq",
     output_dir: str = "data/analysis",
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     actual_plan_days의 음수/0/양수 분포 및 추가 통계를 분석합니다.
@@ -2039,12 +2894,16 @@ def analyze_actual_plan_days(
         db_path: DuckDB 데이터베이스 경로
         seq_table: 트랜잭션 시퀀스 테이블명 (기본값: transactions_seq)
         output_dir: 그래프 저장 디렉토리 (기본값: data/analysis)
+        num_samples: 샘플 출력 행 수 (None이면 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
     """
     import matplotlib.pyplot as plt
 
     logger.info(f"=== actual_plan_days 분석 시작 ===")
     logger.info(f"테이블: {seq_table}")
     logger.info(f"출력 디렉토리: {output_dir}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -2467,6 +3326,21 @@ def analyze_actual_plan_days(
         for plan, actual, cancel, cnt, user_cnt in neg_patterns:
             logger.info(f"  plan={plan}, actual={actual}, is_cancel={cancel}: {cnt:,} 행, {user_cnt:,} 유저")
 
+    if num_samples is not None and num_samples > 0:
+        sample_rows = con.execute(f"""
+            SELECT
+                user_id,
+                transaction_date,
+                payment_plan_days,
+                actual_plan_days,
+                is_cancel
+            FROM {seq_table}
+            ORDER BY actual_plan_days ASC
+            LIMIT {num_samples}
+        """).fetchdf()
+        if not sample_rows.empty:
+            logger.info(f"샘플 케이스 (actual_plan_days 하위 {num_samples}개):\n{sample_rows.to_string()}")
+
     con.close()
     logger.info(f"\n=== actual_plan_days 분석 완료 ===\n")
 
@@ -2478,6 +3352,8 @@ def analyze_cancel_actual_plan_days(
     db_path: str,
     seq_table: str = "transactions_seq",
     output_dir: str = "data/analysis",
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     is_cancel=1인 트랜잭션의 actual_plan_days 분포를 분석합니다.
@@ -2486,12 +3362,16 @@ def analyze_cancel_actual_plan_days(
         db_path: DuckDB 데이터베이스 경로
         seq_table: 트랜잭션 시퀀스 테이블명 (기본값: transactions_seq)
         output_dir: 그래프 저장 디렉토리 (기본값: data/analysis)
+        num_samples: 샘플 출력 행 수 (None이면 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
     """
     import matplotlib.pyplot as plt
 
     logger.info(f"=== is_cancel=1 actual_plan_days 분석 시작 ===")
     logger.info(f"테이블: {seq_table}")
     logger.info(f"출력 디렉토리: {output_dir}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -2688,6 +3568,21 @@ def analyze_cancel_actual_plan_days(
     plt.close()
     logger.info(f"\n그래프 저장: {plot_path}")
 
+    if num_samples is not None and num_samples > 0:
+        sample_rows = con.execute(f"""
+            SELECT
+                user_id,
+                transaction_date,
+                payment_plan_days,
+                actual_plan_days
+            FROM {seq_table}
+            WHERE is_cancel = 1
+            ORDER BY actual_plan_days ASC
+            LIMIT {num_samples}
+        """).fetchdf()
+        if not sample_rows.empty:
+            logger.info(f"샘플 케이스 (is_cancel=1, 상위 {num_samples}개):\n{sample_rows.to_string()}")
+
     con.close()
     logger.info(f"=== is_cancel=1 actual_plan_days 분석 완료 ===\n")
 
@@ -2703,6 +3598,8 @@ def exclude_out_of_range_actual_plan_days_users(
     non_cancel_max: int = 410,
     cancel_min: int = -31,
     cancel_max: int = 410,
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     actual_plan_days가 지정된 범위를 벗어나는 트랜잭션을 가진 유저를 모든 _merge 테이블에서 제외합니다.
@@ -2720,6 +3617,8 @@ def exclude_out_of_range_actual_plan_days_users(
         non_cancel_max: is_cancel=0일 때 최대 actual_plan_days (포함, 기본값: 410)
         cancel_min: is_cancel=1일 때 최소 actual_plan_days (포함, 기본값: -31)
         cancel_max: is_cancel=1일 때 최대 actual_plan_days (포함, 기본값: 410)
+        num_samples: 제외 샘플 출력 유저 수 (None이면 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
     """
     if target_tables is None:
         target_tables = ["train_merge", "transactions_merge", "user_logs_merge", "members_merge"]
@@ -2729,6 +3628,8 @@ def exclude_out_of_range_actual_plan_days_users(
     logger.info(f"is_cancel=0 범위: [{non_cancel_min}, {non_cancel_max}]")
     logger.info(f"is_cancel=1 범위: [{cancel_min}, {cancel_max}]")
     logger.info(f"대상 테이블: {target_tables}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     con = duckdb.connect(db_path)
     con.execute("PRAGMA threads=8;")
@@ -2758,21 +3659,30 @@ def exclude_out_of_range_actual_plan_days_users(
     """).fetchone()[0]
     logger.info(f"시퀀스 테이블 전체 유저 수: {total_users:,}")
 
-    # 범위 밖 actual_plan_days를 가진 유저 추출 (is_cancel별 다른 조건)
-    con.execute(f"""
-        CREATE OR REPLACE TABLE _out_of_range_actual_plan_users_temp AS
+    out_of_range_subquery = f"""
         SELECT DISTINCT {id_col}
         FROM {seq_table}
         WHERE
-            -- is_cancel=0: [{non_cancel_min}, {non_cancel_max}] 범위 밖
             (is_cancel = 0 AND (actual_plan_days < {non_cancel_min} OR actual_plan_days > {non_cancel_max}))
             OR
-            -- is_cancel=1: [{cancel_min}, {cancel_max}] 범위 밖
-            (is_cancel = 1 AND (actual_plan_days < {cancel_min} OR actual_plan_days > {cancel_max}));
-    """)
+            (is_cancel = 1 AND (actual_plan_days < {cancel_min} OR actual_plan_days > {cancel_max}))
+    """
 
-    out_of_range_count = con.execute("SELECT COUNT(*) FROM _out_of_range_actual_plan_users_temp").fetchone()[0]
+    out_of_range_count = con.execute(f"""
+        SELECT COUNT(*) FROM (
+            {out_of_range_subquery}
+        ) t
+    """).fetchone()[0]
     logger.info(f"범위 밖 유저 수: {out_of_range_count:,} ({out_of_range_count/total_users*100:.2f}%)")
+
+    if num_samples is not None and num_samples > 0:
+        sample_users = con.execute(f"""
+            SELECT {id_col}
+            FROM ({out_of_range_subquery}) t
+            LIMIT {num_samples}
+        """).fetchdf()
+        if not sample_users.empty:
+            logger.info(f"제외 샘플 유저 (상위 {num_samples}명):\n{sample_users.to_string()}")
 
     # 범위 밖 상세 통계 (is_cancel별)
     out_of_range_stats = con.execute(f"""
@@ -2802,9 +3712,53 @@ def exclude_out_of_range_actual_plan_days_users(
 
     if out_of_range_count == 0:
         logger.info("제외할 유저가 없습니다.")
-        con.execute("DROP TABLE IF EXISTS _out_of_range_actual_plan_users_temp;")
         con.close()
         return
+
+    if dry_run:
+        for t in tqdm(target_tables, desc="actual_plan_days 범위 밖 유저 제외"):
+            if t not in existing_tables:
+                logger.warning(f"  {t}: 존재하지 않음, 건너뜀")
+                continue
+
+            target_cols = [row[0] for row in con.execute(f"DESCRIBE {t}").fetchall()]
+            if "user_id" in target_cols:
+                target_col = "user_id"
+            elif "msno" in target_cols:
+                target_col = "msno"
+            else:
+                logger.warning(f"  {t}: user_id/msno 컬럼 없음, 건너뜀")
+                continue
+
+            logger.info(f"  {t} 필터링 중...")
+
+            before_rows = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            before_unique = con.execute(f"SELECT COUNT(DISTINCT {target_col}) FROM {t}").fetchone()[0]
+
+            after_rows = con.execute(f"""
+                SELECT COUNT(*) FROM {t}
+                WHERE {target_col} NOT IN ({out_of_range_subquery});
+            """).fetchone()[0]
+            after_unique = con.execute(f"""
+                SELECT COUNT(DISTINCT {target_col}) FROM {t}
+                WHERE {target_col} NOT IN ({out_of_range_subquery});
+            """).fetchone()[0]
+
+            rows_removed = before_rows - after_rows
+            users_removed = before_unique - after_unique
+
+            logger.info(f"    {before_rows:,} -> {after_rows:,} 행 ({rows_removed:,} 제거)")
+            logger.info(f"    {before_unique:,} -> {after_unique:,} 고유 유저 ({users_removed:,} 제거)")
+
+        con.close()
+        logger.info(f"=== actual_plan_days 범위 밖 유저 제외 완료 ===\n")
+        return
+
+    # 범위 밖 actual_plan_days를 가진 유저 추출 (is_cancel별 다른 조건)
+    con.execute(f"""
+        CREATE OR REPLACE TABLE _out_of_range_actual_plan_users_temp AS
+        {out_of_range_subquery};
+    """)
 
     # 대상 테이블에서 범위 밖 유저 제외
     for t in tqdm(target_tables, desc="actual_plan_days 범위 밖 유저 제외"):
@@ -2863,6 +3817,8 @@ def exclude_out_of_range_actual_plan_days_users(
 def add_plan_days_diff(
     db_path: str,
     seq_table: str = "transactions_seq",
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     transactions_seq 테이블에 plan_days_diff 컬럼을 추가합니다.
@@ -2875,8 +3831,12 @@ def add_plan_days_diff(
     Args:
         db_path: DuckDB 데이터베이스 경로
         seq_table: 트랜잭션 시퀀스 테이블명 (기본값: transactions_seq)
+        num_samples: 샘플 출력 행 수 (None이면 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
     """
     logger.info(f"=== {seq_table}에 plan_days_diff 추가 시작 ===")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     con = duckdb.connect(db_path)
     con.execute("PRAGMA threads=8;")
@@ -2892,10 +3852,70 @@ def add_plan_days_diff(
     columns = [row[0] for row in con.execute(f"DESCRIBE {seq_table}").fetchall()]
     if "plan_days_diff" in columns:
         logger.info("plan_days_diff 컬럼이 이미 존재합니다. 재계산합니다.")
-        con.execute(f"ALTER TABLE {seq_table} DROP COLUMN plan_days_diff")
+        if dry_run:
+            logger.info("DRY RUN: 기존 plan_days_diff 컬럼 삭제는 생략합니다.")
+        else:
+            con.execute(f"ALTER TABLE {seq_table} DROP COLUMN plan_days_diff")
 
     # plan_days_diff 컬럼 추가
     logger.info("plan_days_diff 계산 중...")
+    if dry_run:
+        diff_expr = "payment_plan_days - actual_plan_days"
+        stats = con.execute(f"""
+            SELECT
+                COUNT(*) AS total_rows,
+                SUM(CASE WHEN {diff_expr} > 0 THEN 1 ELSE 0 END) AS positive_cnt,
+                SUM(CASE WHEN {diff_expr} = 0 THEN 1 ELSE 0 END) AS zero_cnt,
+                SUM(CASE WHEN {diff_expr} < 0 THEN 1 ELSE 0 END) AS negative_cnt,
+                ROUND(AVG({diff_expr}), 2) AS avg_diff,
+                MIN({diff_expr}) AS min_diff,
+                MAX({diff_expr}) AS max_diff
+            FROM {seq_table}
+        """).fetchone()
+
+        total, pos, zero, neg, avg, min_val, max_val = stats
+        logger.info(f"추가 예정: {total:,} 행")
+        logger.info(f"plan_days_diff 통계:")
+        logger.info(f"  양수 (payment > actual): {pos:,} ({pos/total*100:.2f}%)")
+        logger.info(f"  0 (payment = actual): {zero:,} ({zero/total*100:.2f}%)")
+        logger.info(f"  음수 (payment < actual): {neg:,} ({neg/total*100:.2f}%)")
+        logger.info(f"  평균: {avg}, 범위: [{min_val}, {max_val}]")
+
+        cancel_stats = con.execute(f"""
+            SELECT
+                is_cancel,
+                COUNT(*) AS cnt,
+                ROUND(AVG({diff_expr}), 2) AS avg_diff,
+                MIN({diff_expr}) AS min_diff,
+                MAX({diff_expr}) AS max_diff
+            FROM {seq_table}
+            GROUP BY is_cancel
+            ORDER BY is_cancel
+        """).fetchall()
+
+        logger.info(f"is_cancel별 통계:")
+        for is_cancel, cnt, avg, min_val, max_val in cancel_stats:
+            logger.info(f"  is_cancel={is_cancel}: {cnt:,} 행, avg={avg}, range=[{min_val}, {max_val}]")
+
+        if num_samples is not None and num_samples > 0:
+            sample_rows = con.execute(f"""
+                SELECT
+                    user_id,
+                    transaction_date,
+                    payment_plan_days,
+                    actual_plan_days,
+                    {diff_expr} AS plan_days_diff,
+                    is_cancel
+                FROM {seq_table}
+                ORDER BY ABS({diff_expr}) DESC
+                LIMIT {num_samples}
+            """).fetchdf()
+            if not sample_rows.empty:
+                logger.info(f"샘플 케이스 (plan_days_diff 상위 {num_samples}개, dry_run):\n{sample_rows.to_string()}")
+
+        con.close()
+        logger.info(f"=== {seq_table}에 plan_days_diff 추가 완료 ===\n")
+        return
     con.execute(f"""
         ALTER TABLE {seq_table}
         ADD COLUMN plan_days_diff BIGINT;
@@ -2944,6 +3964,22 @@ def add_plan_days_diff(
     for is_cancel, cnt, avg, min_val, max_val in cancel_stats:
         logger.info(f"  is_cancel={is_cancel}: {cnt:,} 행, avg={avg}, range=[{min_val}, {max_val}]")
 
+    if num_samples is not None and num_samples > 0:
+        sample_rows = con.execute(f"""
+            SELECT
+                user_id,
+                transaction_date,
+                payment_plan_days,
+                actual_plan_days,
+                plan_days_diff,
+                is_cancel
+            FROM {seq_table}
+            ORDER BY ABS(plan_days_diff) DESC
+            LIMIT {num_samples}
+        """).fetchdf()
+        if not sample_rows.empty:
+            logger.info(f"샘플 케이스 (plan_days_diff 상위 {num_samples}개):\n{sample_rows.to_string()}")
+
     con.close()
     logger.info(f"=== {seq_table}에 plan_days_diff 추가 완료 ===\n")
 
@@ -2955,6 +3991,8 @@ def analyze_cancel_actual_plan_days_distribution(
     db_path: str,
     seq_table: str = "transactions_seq",
     output_dir: str = "data/analysis",
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     is_cancel=1인 트랜잭션의 actual_plan_days 분포를 상세 분석합니다.
@@ -2963,12 +4001,16 @@ def analyze_cancel_actual_plan_days_distribution(
         db_path: DuckDB 데이터베이스 경로
         seq_table: 트랜잭션 시퀀스 테이블명 (기본값: transactions_seq)
         output_dir: 그래프 저장 디렉토리 (기본값: data/analysis)
+        num_samples: 샘플 출력 행 수 (None이면 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
     """
     import matplotlib.pyplot as plt
 
     logger.info(f"=== is_cancel 트랜잭션 actual_plan_days 분포 분석 시작 ===")
     logger.info(f"테이블: {seq_table}")
     logger.info(f"출력 디렉토리: {output_dir}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -3196,6 +4238,21 @@ def analyze_cancel_actual_plan_days_distribution(
     plt.close()
     logger.info(f"그래프 저장: {hist_path}")
 
+    if num_samples is not None and num_samples > 0:
+        sample_rows = con.execute(f"""
+            SELECT
+                user_id,
+                transaction_date,
+                payment_plan_days,
+                actual_plan_days
+            FROM {seq_table}
+            WHERE is_cancel = 1
+            ORDER BY actual_plan_days ASC
+            LIMIT {num_samples}
+        """).fetchdf()
+        if not sample_rows.empty:
+            logger.info(f"샘플 케이스 (is_cancel=1, 상위 {num_samples}개):\n{sample_rows.to_string()}")
+
     con.close()
     logger.info(f"=== is_cancel 트랜잭션 actual_plan_days 분포 분석 완료 ===\n")
 
@@ -3207,7 +4264,8 @@ def analyze_cancel_expire_before_prev_transaction(
     db_path: str,
     seq_table: str = "transactions_seq",
     output_dir: str = "data/analysis",
-    show_samples: int | None = None,
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     is_cancel=1 트랜잭션 중 membership_expire_date가 이전 트랜잭션의
@@ -3220,13 +4278,16 @@ def analyze_cancel_expire_before_prev_transaction(
         db_path: DuckDB 데이터베이스 경로
         seq_table: 트랜잭션 시퀀스 테이블명 (기본값: transactions_seq)
         output_dir: 그래프 저장 디렉토리 (기본값: data/analysis)
-        show_samples: 샘플 케이스 수 (None이면 샘플 출력 안 함)
+        num_samples: 샘플 케이스 수 (None이면 샘플 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
     """
     import matplotlib.pyplot as plt
 
     logger.info(f"=== is_cancel expire_date < prev_transaction_date 분석 시작 ===")
     logger.info(f"테이블: {seq_table}")
     logger.info(f"출력 디렉토리: {output_dir}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -3413,8 +4474,8 @@ def analyze_cancel_expire_before_prev_transaction(
         logger.info(f"  plan={plan}: {row_cnt:,} 행, {user_cnt:,} 유저, avg_diff={avg_diff}")
 
     # 5. 샘플 케이스
-    if show_samples is not None and show_samples > 0:
-        logger.info(f"\n[5] 샘플 케이스 (상위 {show_samples}개)")
+    if num_samples is not None and num_samples > 0:
+        logger.info(f"\n[5] 샘플 케이스 (상위 {num_samples}개)")
         sample_cases = con.execute(f"""
             WITH with_prev AS (
                 SELECT
@@ -3438,7 +4499,7 @@ def analyze_cancel_expire_before_prev_transaction(
               AND prev_transaction_date IS NOT NULL
               AND membership_expire_date < prev_transaction_date
             ORDER BY days_diff DESC
-            LIMIT {show_samples}
+            LIMIT {num_samples}
         """).fetchdf()
         logger.info(f"\n{sample_cases.to_string()}")
 
@@ -3515,6 +4576,8 @@ def exclude_cancel_expire_before_prev_transaction_users(
     db_path: str,
     seq_table: str = "transactions_seq",
     target_tables: list[str] = None,
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     is_cancel=1 트랜잭션 중 membership_expire_date가 이전 트랜잭션의
@@ -3525,6 +4588,8 @@ def exclude_cancel_expire_before_prev_transaction_users(
         seq_table: 트랜잭션 시퀀스 테이블명 (기본값: transactions_seq)
         target_tables: 필터링을 적용할 대상 테이블 이름 리스트
                        기본값: ["train_merge", "transactions_merge", "user_logs_merge", "members_merge"]
+        num_samples: 제외 샘플 출력 유저 수 (None이면 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
     """
     if target_tables is None:
         target_tables = ["train_merge", "transactions_merge", "user_logs_merge", "members_merge"]
@@ -3532,6 +4597,8 @@ def exclude_cancel_expire_before_prev_transaction_users(
     logger.info(f"=== is_cancel expire_date < prev_transaction_date 유저 제외 시작 ===")
     logger.info(f"시퀀스 테이블: {seq_table}")
     logger.info(f"대상 테이블: {target_tables}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     con = duckdb.connect(db_path)
     con.execute("PRAGMA threads=8;")
@@ -3561,9 +4628,7 @@ def exclude_cancel_expire_before_prev_transaction_users(
     """).fetchone()[0]
     logger.info(f"시퀀스 테이블 전체 유저 수: {total_users:,}")
 
-    # 해당 조건에 맞는 유저 추출
-    con.execute(f"""
-        CREATE OR REPLACE TABLE _cancel_expire_anomaly_users_temp AS
+    anomaly_subquery = f"""
         WITH with_prev AS (
             SELECT
                 {id_col},
@@ -3579,17 +4644,74 @@ def exclude_cancel_expire_before_prev_transaction_users(
         FROM with_prev
         WHERE is_cancel = 1
           AND prev_transaction_date IS NOT NULL
-          AND membership_expire_date < prev_transaction_date;
-    """)
+          AND membership_expire_date < prev_transaction_date
+    """
 
-    anomaly_count = con.execute("SELECT COUNT(*) FROM _cancel_expire_anomaly_users_temp").fetchone()[0]
+    anomaly_count = con.execute(f"""
+        SELECT COUNT(*) FROM (
+            {anomaly_subquery}
+        ) t
+    """).fetchone()[0]
     logger.info(f"제외 대상 유저 수: {anomaly_count:,} ({anomaly_count/total_users*100:.2f}%)")
+
+    if num_samples is not None and num_samples > 0:
+        sample_users = con.execute(f"""
+            SELECT {id_col}
+            FROM ({anomaly_subquery}) t
+            LIMIT {num_samples}
+        """).fetchdf()
+        if not sample_users.empty:
+            logger.info(f"제외 샘플 유저 (상위 {num_samples}명):\n{sample_users.to_string()}")
 
     if anomaly_count == 0:
         logger.info("제외할 유저가 없습니다.")
-        con.execute("DROP TABLE IF EXISTS _cancel_expire_anomaly_users_temp;")
         con.close()
         return
+
+    if dry_run:
+        for t in tqdm(target_tables, desc="cancel expire anomaly 유저 제외"):
+            if t not in existing_tables:
+                logger.warning(f"  {t}: 존재하지 않음, 건너뜀")
+                continue
+
+            target_cols = [row[0] for row in con.execute(f"DESCRIBE {t}").fetchall()]
+            if "user_id" in target_cols:
+                target_col = "user_id"
+            elif "msno" in target_cols:
+                target_col = "msno"
+            else:
+                logger.warning(f"  {t}: user_id/msno 컬럼 없음, 건너뜀")
+                continue
+
+            logger.info(f"  {t} 필터링 중...")
+
+            before_rows = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            before_unique = con.execute(f"SELECT COUNT(DISTINCT {target_col}) FROM {t}").fetchone()[0]
+
+            after_rows = con.execute(f"""
+                SELECT COUNT(*) FROM {t}
+                WHERE {target_col} NOT IN ({anomaly_subquery});
+            """).fetchone()[0]
+            after_unique = con.execute(f"""
+                SELECT COUNT(DISTINCT {target_col}) FROM {t}
+                WHERE {target_col} NOT IN ({anomaly_subquery});
+            """).fetchone()[0]
+
+            rows_removed = before_rows - after_rows
+            users_removed = before_unique - after_unique
+
+            logger.info(f"    {before_rows:,} -> {after_rows:,} 행 ({rows_removed:,} 제거)")
+            logger.info(f"    {before_unique:,} -> {after_unique:,} 고유 유저 ({users_removed:,} 제거)")
+
+        con.close()
+        logger.info(f"=== is_cancel expire_date < prev_transaction_date 유저 제외 완료 ===\n")
+        return
+
+    # 해당 조건에 맞는 유저 추출
+    con.execute(f"""
+        CREATE OR REPLACE TABLE _cancel_expire_anomaly_users_temp AS
+        {anomaly_subquery};
+    """)
 
     # 대상 테이블에서 해당 유저 제외
     for t in tqdm(target_tables, desc="cancel expire anomaly 유저 제외"):
@@ -3649,7 +4771,8 @@ def analyze_cancel_expire_before_prev_prev_expire(
     db_path: str,
     seq_table: str = "transactions_seq",
     output_dir: str = "data/analysis",
-    show_samples: int | None = None,
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     is_cancel=1 트랜잭션 중 membership_expire_date가 이전 두 번째 트랜잭션의
@@ -3662,13 +4785,16 @@ def analyze_cancel_expire_before_prev_prev_expire(
         db_path: DuckDB 데이터베이스 경로
         seq_table: 트랜잭션 시퀀스 테이블명 (기본값: transactions_seq)
         output_dir: 그래프 저장 디렉토리 (기본값: data/analysis)
-        show_samples: 샘플 케이스 수 (None이면 샘플 출력 안 함)
+        num_samples: 샘플 케이스 수 (None이면 샘플 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
     """
     import matplotlib.pyplot as plt
 
     logger.info(f"=== is_cancel expire_date < prev_prev_expire_date 분석 시작 ===")
     logger.info(f"테이블: {seq_table}")
     logger.info(f"출력 디렉토리: {output_dir}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -3855,8 +4981,8 @@ def analyze_cancel_expire_before_prev_prev_expire(
         logger.info(f"  plan={plan}: {row_cnt:,} 행, {user_cnt:,} 유저, avg_diff={avg_diff}")
 
     # 5. 샘플 케이스
-    if show_samples is not None and show_samples > 0:
-        logger.info(f"\n[5] 샘플 케이스 (상위 {show_samples}개)")
+    if num_samples is not None and num_samples > 0:
+        logger.info(f"\n[5] 샘플 케이스 (상위 {num_samples}개)")
         sample_cases = con.execute(f"""
             WITH with_prev_prev AS (
                 SELECT
@@ -3885,7 +5011,7 @@ def analyze_cancel_expire_before_prev_prev_expire(
               AND prev_prev_expire_date IS NOT NULL
               AND membership_expire_date < prev_prev_expire_date
             ORDER BY days_diff DESC
-            LIMIT {show_samples}
+            LIMIT {num_samples}
         """).fetchdf()
         logger.info(f"\n{sample_cases.to_string()}")
 
@@ -3962,6 +5088,8 @@ def exclude_cancel_expire_before_prev_prev_expire_users(
     db_path: str,
     seq_table: str = "transactions_seq",
     target_tables: list[str] = None,
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     is_cancel=1 트랜잭션 중 membership_expire_date가 이전 두 번째 트랜잭션의
@@ -3972,6 +5100,8 @@ def exclude_cancel_expire_before_prev_prev_expire_users(
         seq_table: 트랜잭션 시퀀스 테이블명 (기본값: transactions_seq)
         target_tables: 필터링을 적용할 대상 테이블 이름 리스트
                        기본값: ["train_merge", "transactions_merge", "user_logs_merge", "members_merge"]
+        num_samples: 제외 샘플 출력 유저 수 (None이면 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
     """
     if target_tables is None:
         target_tables = ["train_merge", "transactions_merge", "user_logs_merge", "members_merge"]
@@ -3979,6 +5109,8 @@ def exclude_cancel_expire_before_prev_prev_expire_users(
     logger.info(f"=== is_cancel expire_date < prev_prev_expire_date 유저 제외 시작 ===")
     logger.info(f"시퀀스 테이블: {seq_table}")
     logger.info(f"대상 테이블: {target_tables}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     con = duckdb.connect(db_path)
     con.execute("PRAGMA threads=8;")
@@ -4008,9 +5140,7 @@ def exclude_cancel_expire_before_prev_prev_expire_users(
     """).fetchone()[0]
     logger.info(f"시퀀스 테이블 전체 유저 수: {total_users:,}")
 
-    # 해당 조건에 맞는 유저 추출
-    con.execute(f"""
-        CREATE OR REPLACE TABLE _cancel_prev_prev_anomaly_users_temp AS
+    anomaly_subquery = f"""
         WITH with_prev_prev AS (
             SELECT
                 {id_col},
@@ -4026,17 +5156,74 @@ def exclude_cancel_expire_before_prev_prev_expire_users(
         FROM with_prev_prev
         WHERE is_cancel = 1
           AND prev_prev_expire_date IS NOT NULL
-          AND membership_expire_date < prev_prev_expire_date;
-    """)
+          AND membership_expire_date < prev_prev_expire_date
+    """
 
-    anomaly_count = con.execute("SELECT COUNT(*) FROM _cancel_prev_prev_anomaly_users_temp").fetchone()[0]
+    anomaly_count = con.execute(f"""
+        SELECT COUNT(*) FROM (
+            {anomaly_subquery}
+        ) t
+    """).fetchone()[0]
     logger.info(f"제외 대상 유저 수: {anomaly_count:,} ({anomaly_count/total_users*100:.2f}%)")
+
+    if num_samples is not None and num_samples > 0:
+        sample_users = con.execute(f"""
+            SELECT {id_col}
+            FROM ({anomaly_subquery}) t
+            LIMIT {num_samples}
+        """).fetchdf()
+        if not sample_users.empty:
+            logger.info(f"제외 샘플 유저 (상위 {num_samples}명):\n{sample_users.to_string()}")
 
     if anomaly_count == 0:
         logger.info("제외할 유저가 없습니다.")
-        con.execute("DROP TABLE IF EXISTS _cancel_prev_prev_anomaly_users_temp;")
         con.close()
         return
+
+    if dry_run:
+        for t in tqdm(target_tables, desc="cancel prev_prev expire anomaly 유저 제외"):
+            if t not in existing_tables:
+                logger.warning(f"  {t}: 존재하지 않음, 건너뜀")
+                continue
+
+            target_cols = [row[0] for row in con.execute(f"DESCRIBE {t}").fetchall()]
+            if "user_id" in target_cols:
+                target_col = "user_id"
+            elif "msno" in target_cols:
+                target_col = "msno"
+            else:
+                logger.warning(f"  {t}: user_id/msno 컬럼 없음, 건너뜀")
+                continue
+
+            logger.info(f"  {t} 필터링 중...")
+
+            before_rows = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            before_unique = con.execute(f"SELECT COUNT(DISTINCT {target_col}) FROM {t}").fetchone()[0]
+
+            after_rows = con.execute(f"""
+                SELECT COUNT(*) FROM {t}
+                WHERE {target_col} NOT IN ({anomaly_subquery});
+            """).fetchone()[0]
+            after_unique = con.execute(f"""
+                SELECT COUNT(DISTINCT {target_col}) FROM {t}
+                WHERE {target_col} NOT IN ({anomaly_subquery});
+            """).fetchone()[0]
+
+            rows_removed = before_rows - after_rows
+            users_removed = before_unique - after_unique
+
+            logger.info(f"    {before_rows:,} -> {after_rows:,} 행 ({rows_removed:,} 제거)")
+            logger.info(f"    {before_unique:,} -> {after_unique:,} 고유 유저 ({users_removed:,} 제거)")
+
+        con.close()
+        logger.info(f"=== is_cancel expire_date < prev_prev_expire_date 유저 제외 완료 ===\n")
+        return
+
+    # 해당 조건에 맞는 유저 추출
+    con.execute(f"""
+        CREATE OR REPLACE TABLE _cancel_prev_prev_anomaly_users_temp AS
+        {anomaly_subquery};
+    """)
 
     # 대상 테이블에서 해당 유저 제외
     for t in tqdm(target_tables, desc="cancel prev_prev expire anomaly 유저 제외"):
@@ -4096,7 +5283,8 @@ def analyze_consecutive_cancel_transactions(
     db_path: str,
     seq_table: str = "transactions_seq",
     output_dir: str = "data/analysis",
-    show_samples: int | None = None,
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     is_cancel=1 트랜잭션이 두 개 이상 연속으로 나타나는 케이스를 분석합니다.
@@ -4105,11 +5293,14 @@ def analyze_consecutive_cancel_transactions(
         db_path: DuckDB 데이터베이스 경로
         seq_table: 트랜잭션 시퀀스 테이블명 (기본값: transactions_seq)
         output_dir: 그래프 저장 디렉토리 (기본값: data/analysis)
-        show_samples: 샘플 유저 수 (None이면 샘플 출력 안 함)
+        num_samples: 샘플 유저 수 (None이면 샘플 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
     """
     logger.info(f"=== 연속 is_cancel=1 트랜잭션 분석 시작 ===")
     logger.info(f"테이블: {seq_table}")
     logger.info(f"출력 디렉토리: {output_dir}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -4297,8 +5488,8 @@ def analyze_consecutive_cancel_transactions(
         logger.info(f"  {bucket:>8}: {row_cnt:,} 행, {user_cnt:,} 유저")
 
     # 샘플 케이스 출력
-    if show_samples is not None and show_samples > 0:
-        logger.info(f"\n[5] 샘플 케이스 (유저별 연속 취소 트랜잭션, {show_samples}명)")
+    if num_samples is not None and num_samples > 0:
+        logger.info(f"\n[5] 샘플 케이스 (유저별 연속 취소 트랜잭션, {num_samples}명)")
         sample_users = con.execute(f"""
             WITH with_prev_cancel AS (
                 SELECT
@@ -4313,7 +5504,7 @@ def analyze_consecutive_cancel_transactions(
                 SELECT DISTINCT user_id
                 FROM with_prev_cancel
                 WHERE is_cancel = 1 AND prev_is_cancel = 1
-                LIMIT {show_samples}
+                LIMIT {num_samples}
             )
             SELECT
                 s.user_id,
@@ -4388,6 +5579,8 @@ def exclude_consecutive_cancel_users(
     db_path: str,
     seq_table: str = "transactions_seq",
     target_tables: list[str] = None,
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     is_cancel=1 트랜잭션이 두 개 이상 연속으로 나타나는 유저를 모든 _merge 테이블에서 제외합니다.
@@ -4397,6 +5590,8 @@ def exclude_consecutive_cancel_users(
         seq_table: 트랜잭션 시퀀스 테이블명 (기본값: transactions_seq)
         target_tables: 필터링을 적용할 대상 테이블 이름 리스트
                        기본값: ["train_merge", "transactions_merge", "user_logs_merge", "members_merge"]
+        num_samples: 제외 샘플 출력 유저 수 (None이면 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
     """
     if target_tables is None:
         target_tables = ["train_merge", "transactions_merge", "user_logs_merge", "members_merge"]
@@ -4404,6 +5599,8 @@ def exclude_consecutive_cancel_users(
     logger.info(f"=== 연속 is_cancel=1 유저 제외 시작 ===")
     logger.info(f"시퀀스 테이블: {seq_table}")
     logger.info(f"대상 테이블: {target_tables}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     con = duckdb.connect(db_path)
     con.execute("PRAGMA threads=8;")
@@ -4433,9 +5630,7 @@ def exclude_consecutive_cancel_users(
     """).fetchone()[0]
     logger.info(f"시퀀스 테이블 전체 유저 수: {total_users:,}")
 
-    # 연속 is_cancel=1을 가진 유저 추출
-    con.execute(f"""
-        CREATE OR REPLACE TABLE _consecutive_cancel_users_temp AS
+    consecutive_subquery = f"""
         WITH with_prev_cancel AS (
             SELECT
                 {id_col},
@@ -4448,17 +5643,74 @@ def exclude_consecutive_cancel_users(
         )
         SELECT DISTINCT {id_col}
         FROM with_prev_cancel
-        WHERE is_cancel = 1 AND prev_is_cancel = 1;
-    """)
+        WHERE is_cancel = 1 AND prev_is_cancel = 1
+    """
 
-    anomaly_count = con.execute("SELECT COUNT(*) FROM _consecutive_cancel_users_temp").fetchone()[0]
+    anomaly_count = con.execute(f"""
+        SELECT COUNT(*) FROM (
+            {consecutive_subquery}
+        ) t
+    """).fetchone()[0]
     logger.info(f"제외 대상 유저 수: {anomaly_count:,} ({anomaly_count/total_users*100:.2f}%)")
+
+    if num_samples is not None and num_samples > 0:
+        sample_users = con.execute(f"""
+            SELECT {id_col}
+            FROM ({consecutive_subquery}) t
+            LIMIT {num_samples}
+        """).fetchdf()
+        if not sample_users.empty:
+            logger.info(f"제외 샘플 유저 (상위 {num_samples}명):\n{sample_users.to_string()}")
 
     if anomaly_count == 0:
         logger.info("제외할 유저가 없습니다.")
-        con.execute("DROP TABLE IF EXISTS _consecutive_cancel_users_temp;")
         con.close()
         return
+
+    if dry_run:
+        for t in tqdm(target_tables, desc="연속 is_cancel 유저 제외"):
+            if t not in existing_tables:
+                logger.warning(f"  {t}: 존재하지 않음, 건너뜀")
+                continue
+
+            target_cols = [row[0] for row in con.execute(f"DESCRIBE {t}").fetchall()]
+            if "user_id" in target_cols:
+                target_col = "user_id"
+            elif "msno" in target_cols:
+                target_col = "msno"
+            else:
+                logger.warning(f"  {t}: user_id/msno 컬럼 없음, 건너뜀")
+                continue
+
+            logger.info(f"  {t} 필터링 중...")
+
+            before_rows = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            before_unique = con.execute(f"SELECT COUNT(DISTINCT {target_col}) FROM {t}").fetchone()[0]
+
+            after_rows = con.execute(f"""
+                SELECT COUNT(*) FROM {t}
+                WHERE {target_col} NOT IN ({consecutive_subquery});
+            """).fetchone()[0]
+            after_unique = con.execute(f"""
+                SELECT COUNT(DISTINCT {target_col}) FROM {t}
+                WHERE {target_col} NOT IN ({consecutive_subquery});
+            """).fetchone()[0]
+
+            rows_removed = before_rows - after_rows
+            users_removed = before_unique - after_unique
+
+            logger.info(f"    {before_rows:,} -> {after_rows:,} 행 ({rows_removed:,} 제거)")
+            logger.info(f"    {before_unique:,} -> {after_unique:,} 고유 유저 ({users_removed:,} 제거)")
+
+        con.close()
+        logger.info(f"=== 연속 is_cancel=1 유저 제외 완료 ===\n")
+        return
+
+    # 연속 is_cancel=1을 가진 유저 추출
+    con.execute(f"""
+        CREATE OR REPLACE TABLE _consecutive_cancel_users_temp AS
+        {consecutive_subquery};
+    """)
 
     # 대상 테이블에서 해당 유저 제외
     for t in tqdm(target_tables, desc="연속 is_cancel 유저 제외"):
@@ -4517,6 +5769,8 @@ def exclude_consecutive_cancel_users(
 def analyze_expire_date_decrease(
     db_path: str,
     seq_table: str = "transactions_seq",
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     같은 sequence_group 내에서 membership_expire_date가 감소하는 케이스를 분석합니다.
@@ -4524,9 +5778,13 @@ def analyze_expire_date_decrease(
     Args:
         db_path: DuckDB 데이터베이스 경로
         seq_table: 트랜잭션 시퀀스 테이블명 (기본값: transactions_seq)
+        num_samples: 샘플 출력 행 수 (None이면 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
     """
     logger.info(f"=== membership_expire_date 감소 케이스 분석 시작 ===")
     logger.info(f"테이블: {seq_table}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     con = duckdb.connect(db_path)
     con.execute("PRAGMA threads=8;")
@@ -4710,35 +5968,35 @@ def analyze_expire_date_decrease(
     for is_cancel, min_d, max_d, avg_d, med_d in decrease_summary:
         logger.info(f"  is_cancel={is_cancel}: min={min_d}, max={max_d}, avg={avg_d}, median={med_d}")
 
-    # 샘플 케이스 출력
-    logger.info(f"\n[5] 감소 케이스 샘플 (상위 10개)")
-    sample_cases = con.execute(f"""
-        WITH with_prev_expire AS (
+    if num_samples is not None and num_samples > 0:
+        logger.info(f"\n[5] 감소 케이스 샘플 (상위 {num_samples}개)")
+        sample_cases = con.execute(f"""
+            WITH with_prev_expire AS (
+                SELECT
+                    *,
+                    LAG(membership_expire_date) OVER (
+                        PARTITION BY user_id, sequence_group_id
+                        ORDER BY transaction_date, membership_expire_date
+                    ) AS prev_expire_date
+                FROM {seq_table}
+            )
             SELECT
-                *,
-                LAG(membership_expire_date) OVER (
-                    PARTITION BY user_id, sequence_group_id
-                    ORDER BY transaction_date, membership_expire_date
-                ) AS prev_expire_date
-            FROM {seq_table}
-        )
-        SELECT
-            user_id,
-            sequence_group_id,
-            transaction_date,
-            prev_expire_date,
-            membership_expire_date,
-            CAST(prev_expire_date - membership_expire_date AS BIGINT) AS decrease_days,
-            is_cancel,
-            payment_plan_days
-        FROM with_prev_expire
-        WHERE prev_expire_date IS NOT NULL
-          AND membership_expire_date < prev_expire_date
-        ORDER BY decrease_days DESC
-        LIMIT 10
-    """).fetchdf()
+                user_id,
+                sequence_group_id,
+                transaction_date,
+                prev_expire_date,
+                membership_expire_date,
+                CAST(prev_expire_date - membership_expire_date AS BIGINT) AS decrease_days,
+                is_cancel,
+                payment_plan_days
+            FROM with_prev_expire
+            WHERE prev_expire_date IS NOT NULL
+              AND membership_expire_date < prev_expire_date
+            ORDER BY decrease_days DESC
+            LIMIT {num_samples}
+        """).fetchdf()
 
-    logger.info(f"\n{sample_cases.to_string()}")
+        logger.info(f"\n{sample_cases.to_string()}")
 
     con.close()
     logger.info(f"\n=== membership_expire_date 감소 케이스 분석 완료 ===\n")
@@ -4751,6 +6009,8 @@ def add_membership_seq_info(
     db_path: str,
     members_table: str = "members_merge",
     seq_table: str = "transactions_seq",
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     members_merge 테이블에 멤버십 시퀀스 정보를 추가합니다.
@@ -4763,6 +6023,8 @@ def add_membership_seq_info(
         db_path: DuckDB 데이터베이스 경로
         members_table: 멤버 테이블명 (기본값: members_merge)
         seq_table: 시퀀스 테이블명 (기본값: transactions_seq)
+        num_samples: 샘플 출력 행 수 (None이면 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
 
     추가되는 컬럼:
         - membership_seq_group_id: last_expire 트랜잭션의 sequence_group_id
@@ -4771,6 +6033,8 @@ def add_membership_seq_info(
     logger.info(f"=== 멤버십 시퀀스 정보 추가 시작 ===")
     logger.info(f"대상 테이블: {members_table}")
     logger.info(f"시퀀스 테이블: {seq_table}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     con = duckdb.connect(db_path)
     con.execute("PRAGMA threads=8;")
@@ -4784,6 +6048,95 @@ def add_membership_seq_info(
     if seq_table not in existing_tables:
         logger.error(f"테이블 {seq_table}이 존재하지 않습니다.")
         con.close()
+        return
+
+    if dry_run:
+        mapping_query = f"""
+            WITH matched_txn AS (
+                SELECT
+                    m.user_id,
+                    m.last_expire,
+                    t.transaction_date,
+                    t.membership_expire_date,
+                    t.sequence_group_id,
+                    t.sequence_id,
+                    t.is_cancel,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY m.user_id
+                        ORDER BY t.transaction_date DESC, t.sequence_id DESC
+                    ) AS rn
+                FROM {members_table} m
+                JOIN {seq_table} t ON m.user_id = t.user_id
+                    AND m.last_expire = t.membership_expire_date
+                WHERE m.last_expire IS NOT NULL
+            ),
+            last_expire_txn AS (
+                SELECT * FROM matched_txn WHERE rn = 1
+            ),
+            non_cancel_fallback AS (
+                SELECT
+                    l.user_id,
+                    t2.sequence_group_id AS fallback_seq_group_id,
+                    t2.sequence_id AS fallback_seq_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY l.user_id
+                        ORDER BY t2.transaction_date DESC, t2.sequence_id DESC
+                    ) AS rn2
+                FROM last_expire_txn l
+                JOIN {seq_table} t2 ON l.user_id = t2.user_id
+                    AND t2.is_cancel = 0
+                    AND t2.transaction_date <= l.transaction_date
+                WHERE l.is_cancel = 1
+            ),
+            final_mapping AS (
+                SELECT
+                    l.user_id,
+                    CASE
+                        WHEN l.is_cancel = 1 AND nc.fallback_seq_group_id IS NOT NULL
+                            THEN nc.fallback_seq_group_id
+                        ELSE l.sequence_group_id
+                    END AS final_seq_group_id,
+                    CASE
+                        WHEN l.is_cancel = 1 AND nc.fallback_seq_id IS NOT NULL
+                            THEN nc.fallback_seq_id
+                        ELSE l.sequence_id
+                    END AS final_seq_id
+                FROM last_expire_txn l
+                LEFT JOIN non_cancel_fallback nc ON l.user_id = nc.user_id AND nc.rn2 = 1
+            )
+            SELECT * FROM final_mapping
+        """
+
+        total_members = con.execute(f"SELECT COUNT(*) FROM {members_table}").fetchone()[0]
+        with_seq = con.execute(f"""
+            SELECT COUNT(*) FROM (
+                {mapping_query}
+            ) t
+        """).fetchone()[0]
+        without_seq = total_members - with_seq
+
+        logger.info(f"전체 멤버: {total_members:,}")
+        logger.info(f"시퀀스 정보 매핑 예정: {with_seq:,}")
+        logger.info(f"시퀀스 정보 없음: {without_seq:,}")
+
+        if num_samples is not None and num_samples > 0:
+            sample = con.execute(f"""
+                SELECT m.user_id, m.last_expire,
+                       fm.final_seq_group_id AS membership_seq_group_id,
+                       fm.final_seq_id AS membership_seq_id,
+                       t.is_cancel, t.is_churn
+                FROM {members_table} m
+                LEFT JOIN ({mapping_query}) fm ON m.user_id = fm.user_id
+                LEFT JOIN {seq_table} t ON m.user_id = t.user_id
+                    AND fm.final_seq_group_id = t.sequence_group_id
+                    AND fm.final_seq_id = t.sequence_id
+                WHERE fm.final_seq_group_id IS NOT NULL
+                LIMIT {num_samples}
+            """).fetchdf()
+            logger.info(f"샘플 데이터 (상위 {num_samples}개, dry_run):\n{sample.to_string()}")
+
+        con.close()
+        logger.info(f"=== 멤버십 시퀀스 정보 추가 완료 ===\n")
         return
 
     # 기존 컬럼 삭제 (있으면)
@@ -4881,18 +6234,18 @@ def add_membership_seq_info(
     logger.info(f"시퀀스 정보 매핑됨: {with_seq:,}")
     logger.info(f"시퀀스 정보 없음: {without_seq:,}")
 
-    # 샘플 데이터 출력
-    sample = con.execute(f"""
-        SELECT m.user_id, m.last_expire, m.membership_seq_group_id, m.membership_seq_id,
-               t.is_cancel, t.is_churn
-        FROM {members_table} m
-        LEFT JOIN {seq_table} t ON m.user_id = t.user_id
-            AND m.membership_seq_group_id = t.sequence_group_id
-            AND m.membership_seq_id = t.sequence_id
-        WHERE m.membership_seq_group_id IS NOT NULL
-        LIMIT 10
-    """).fetchdf()
-    logger.info(f"샘플 데이터:\n{sample.to_string()}")
+    if num_samples is not None and num_samples > 0:
+        sample = con.execute(f"""
+            SELECT m.user_id, m.last_expire, m.membership_seq_group_id, m.membership_seq_id,
+                   t.is_cancel, t.is_churn
+            FROM {members_table} m
+            LEFT JOIN {seq_table} t ON m.user_id = t.user_id
+                AND m.membership_seq_group_id = t.sequence_group_id
+                AND m.membership_seq_id = t.sequence_id
+            WHERE m.membership_seq_group_id IS NOT NULL
+            LIMIT {num_samples}
+        """).fetchdf()
+        logger.info(f"샘플 데이터 (상위 {num_samples}개):\n{sample.to_string()}")
 
     con.close()
     logger.info(f"=== 멤버십 시퀀스 정보 추가 완료 ===\n")
@@ -4905,6 +6258,8 @@ def add_membership_duration_info(
     db_path: str,
     members_table: str = "members_merge",
     seq_table: str = "transactions_seq",
+    num_samples: int | None = None,
+    dry_run: bool = False,
 ) -> None:
     """
     members_merge 테이블에 멤버십 기간 정보를 추가합니다.
@@ -4913,6 +6268,8 @@ def add_membership_duration_info(
         db_path: DuckDB 데이터베이스 경로
         members_table: 멤버 테이블명 (기본값: members_merge)
         seq_table: 시퀀스 테이블명 (기본값: transactions_seq)
+        num_samples: 샘플 출력 행 수 (None이면 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
 
     추가되는 컬럼:
         - previous_membership_duration: 직전 멤버십 시작(transaction_date) ~ last_expire 기간 (days)
@@ -4921,6 +6278,8 @@ def add_membership_duration_info(
     logger.info(f"=== 멤버십 기간 정보 추가 시작 ===")
     logger.info(f"대상 테이블: {members_table}")
     logger.info(f"시퀀스 테이블: {seq_table}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
 
     con = duckdb.connect(db_path)
     con.execute("PRAGMA threads=8;")
@@ -4934,6 +6293,74 @@ def add_membership_duration_info(
     if seq_table not in existing_tables:
         logger.error(f"테이블 {seq_table}이 존재하지 않습니다.")
         con.close()
+        return
+
+    if dry_run:
+        duration_query = f"""
+            WITH membership_txn AS (
+                SELECT
+                    m.user_id,
+                    m.last_expire,
+                    t.transaction_date AS membership_start_date
+                FROM {members_table} m
+                JOIN {seq_table} t ON m.user_id = t.user_id
+                    AND m.membership_seq_group_id = t.sequence_group_id
+                    AND m.membership_seq_id = t.sequence_id
+                WHERE m.membership_seq_group_id IS NOT NULL
+            ),
+            seq_start AS (
+                SELECT
+                    m.user_id,
+                    t.transaction_date AS seq_start_date
+                FROM {members_table} m
+                JOIN {seq_table} t ON m.user_id = t.user_id
+                    AND m.membership_seq_group_id = t.sequence_group_id
+                    AND t.sequence_id = 0
+                WHERE m.membership_seq_group_id IS NOT NULL
+            ),
+            duration_calc AS (
+                SELECT
+                    mt.user_id,
+                    mt.last_expire - mt.membership_start_date AS membership_duration,
+                    mt.last_expire - ss.seq_start_date AS seq_duration
+                FROM membership_txn mt
+                JOIN seq_start ss ON mt.user_id = ss.user_id
+            )
+            SELECT * FROM duration_calc
+        """
+
+        total_members = con.execute(f"SELECT COUNT(*) FROM {members_table}").fetchone()[0]
+        stats = con.execute(f"""
+            SELECT
+                COUNT(*) AS with_duration,
+                AVG(membership_duration) AS avg_membership_duration,
+                AVG(seq_duration) AS avg_seq_duration,
+                MIN(membership_duration) AS min_membership_duration,
+                MAX(membership_duration) AS max_membership_duration,
+                MIN(seq_duration) AS min_seq_duration,
+                MAX(seq_duration) AS max_seq_duration
+            FROM ({duration_query}) t
+        """).fetchone()
+
+        logger.info(f"전체 멤버: {total_members:,}")
+        logger.info(f"기간 정보 매핑 예정: {stats[0]:,}")
+        logger.info(f"previous_membership_duration - 평균: {stats[1]:.1f}일, 범위: {stats[3]}~{stats[4]}일")
+        logger.info(f"previous_membership_seq_duration - 평균: {stats[2]:.1f}일, 범위: {stats[5]}~{stats[6]}일")
+
+        if num_samples is not None and num_samples > 0:
+            sample = con.execute(f"""
+                SELECT m.user_id, m.last_expire,
+                       d.membership_duration AS previous_membership_duration,
+                       d.seq_duration AS previous_membership_seq_duration
+                FROM {members_table} m
+                JOIN ({duration_query}) d ON m.user_id = d.user_id
+                ORDER BY d.seq_duration DESC
+                LIMIT {num_samples}
+            """).fetchdf()
+            logger.info(f"샘플 데이터 (시퀀스 기간 긴 순, 상위 {num_samples}개, dry_run):\n{sample.to_string()}")
+
+        con.close()
+        logger.info(f"=== 멤버십 기간 정보 추가 완료 ===\n")
         return
 
     # 기존 컬럼 삭제 (있으면)
@@ -5013,19 +6440,501 @@ def add_membership_duration_info(
     logger.info(f"previous_membership_duration - 평균: {stats[2]:.1f}일, 범위: {stats[4]}~{stats[5]}일")
     logger.info(f"previous_membership_seq_duration - 평균: {stats[3]:.1f}일, 범위: {stats[6]}~{stats[7]}일")
 
-    # 샘플 데이터 출력
-    sample = con.execute(f"""
-        SELECT user_id, last_expire, membership_seq_group_id, membership_seq_id,
-               previous_membership_duration, previous_membership_seq_duration
-        FROM {members_table}
-        WHERE previous_membership_duration IS NOT NULL
-        ORDER BY previous_membership_seq_duration DESC
-        LIMIT 10
-    """).fetchdf()
-    logger.info(f"샘플 데이터 (시퀀스 기간 긴 순):\n{sample.to_string()}")
+    if num_samples is not None and num_samples > 0:
+        sample = con.execute(f"""
+            SELECT user_id, last_expire, membership_seq_group_id, membership_seq_id,
+                   previous_membership_duration, previous_membership_seq_duration
+            FROM {members_table}
+            WHERE previous_membership_duration IS NOT NULL
+            ORDER BY previous_membership_seq_duration DESC
+            LIMIT {num_samples}
+        """).fetchdf()
+        logger.info(f"샘플 데이터 (시퀀스 기간 긴 순, 상위 {num_samples}개):\n{sample.to_string()}")
 
     con.close()
     logger.info(f"=== 멤버십 기간 정보 추가 완료 ===\n")
+
+
+# ============================================================================
+# 14.3. members_merge에 membership_expire_date가 2017년 3월인 마지막 트랜잭션 정보 추가
+# ============================================================================
+def add_march_2017_last_txn_info(
+    db_path: str,
+    members_table: str = "members_merge",
+    seq_table: str = "transactions_seq",
+    num_samples: int | None = None,
+    dry_run: bool = False,
+) -> None:
+    """
+    members_merge 테이블에 membership_expire_date가 2017년 3월인 마지막 트랜잭션 정보를 추가합니다.
+
+    로직:
+    1. 각 시퀀스 그룹에서 membership_expire_date가 2017년 3월인 트랜잭션 중 최대값 찾기
+    2. 최대 expire_date 트랜잭션 이후에 cancel 트랜잭션이 있는지 확인
+    3. cancel이 있으면 cancel의 expire_date를 effective expire로 사용
+       (예: 03-25까지 연장 후 cancel로 03-13이 되면, 03-13 사용)
+    4. 각 유저별로 가장 마지막 effective expire_date를 가진 시퀀스 선택
+
+    Args:
+        db_path: DuckDB 데이터베이스 경로
+        members_table: 멤버 테이블명 (기본값: members_merge)
+        seq_table: 시퀀스 테이블명 (기본값: transactions_seq)
+        num_samples: 샘플 출력 행 수 (None이면 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
+
+    추가되는 컬럼:
+        - last_expire_date: 2017년 3월 내 effective 마지막 membership_expire_date
+        - last_seq_id: 해당 트랜잭션의 sequence_group_id
+        - p_tx_id: 해당 트랜잭션의 sequence_id (previous transaction id)
+        - pp_tx_id: 직전 트랜잭션의 sequence_id (previous-previous transaction id, 없으면 NULL)
+    """
+    logger.info(f"=== membership_expire_date 2017년 3월 마지막 트랜잭션 정보 추가 시작 ===")
+    logger.info(f"대상 테이블: {members_table}")
+    logger.info(f"시퀀스 테이블: {seq_table}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
+
+    con = duckdb.connect(db_path)
+    con.execute("PRAGMA threads=8;")
+
+    # 테이블 존재 확인
+    existing_tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
+    if members_table not in existing_tables:
+        logger.error(f"테이블 {members_table}이 존재하지 않습니다.")
+        con.close()
+        return
+    if seq_table not in existing_tables:
+        logger.error(f"테이블 {seq_table}이 존재하지 않습니다.")
+        con.close()
+        return
+
+    # 매핑 쿼리: membership_expire_date가 2017년 3월인 마지막 트랜잭션 찾기
+    # (max expire 이후 cancel이 있으면 cancel 기준으로 계산)
+    mapping_query = f"""
+        WITH march_2017_expire_txn AS (
+            -- membership_expire_date가 2017년 3월인 트랜잭션
+            SELECT
+                user_id,
+                transaction_date,
+                membership_expire_date,
+                sequence_group_id,
+                sequence_id,
+                is_cancel
+            FROM {seq_table}
+            WHERE membership_expire_date >= DATE '2017-03-01'
+              AND membership_expire_date <= DATE '2017-03-31'
+        ),
+        max_expire_per_seq AS (
+            -- 각 유저+시퀀스별 3월 내 최대 membership_expire_date
+            SELECT
+                user_id,
+                sequence_group_id,
+                MAX(membership_expire_date) AS max_march_expire
+            FROM march_2017_expire_txn
+            GROUP BY user_id, sequence_group_id
+        ),
+        max_expire_txn AS (
+            -- 최대 expire_date를 가진 트랜잭션 (여러 개면 가장 마지막 것)
+            SELECT
+                t.*,
+                ROW_NUMBER() OVER (
+                    PARTITION BY t.user_id, t.sequence_group_id
+                    ORDER BY t.transaction_date DESC, t.sequence_id DESC
+                ) AS rn
+            FROM march_2017_expire_txn t
+            JOIN max_expire_per_seq m
+                ON t.user_id = m.user_id
+                AND t.sequence_group_id = m.sequence_group_id
+                AND t.membership_expire_date = m.max_march_expire
+        ),
+        max_expire_txn_single AS (
+            SELECT * FROM max_expire_txn WHERE rn = 1
+        ),
+        cancel_after_max AS (
+            -- max expire 트랜잭션 이후의 cancel 트랜잭션 (같은 시퀀스, expire_date도 3월)
+            SELECT
+                c.*,
+                ROW_NUMBER() OVER (
+                    PARTITION BY c.user_id, c.sequence_group_id
+                    ORDER BY c.transaction_date DESC, c.sequence_id DESC
+                ) AS rn
+            FROM march_2017_expire_txn c
+            JOIN max_expire_txn_single m
+                ON c.user_id = m.user_id
+                AND c.sequence_group_id = m.sequence_group_id
+            WHERE c.is_cancel = 1
+              AND (c.transaction_date > m.transaction_date
+                   OR (c.transaction_date = m.transaction_date AND c.sequence_id > m.sequence_id))
+        ),
+        effective_per_seq AS (
+            -- 각 시퀀스의 effective 트랜잭션 결정 (cancel이 있으면 cancel 사용)
+            SELECT
+                m.user_id,
+                m.sequence_group_id,
+                COALESCE(ca.membership_expire_date, m.membership_expire_date) AS effective_expire_date,
+                COALESCE(ca.sequence_id, m.sequence_id) AS effective_seq_id
+            FROM max_expire_txn_single m
+            LEFT JOIN cancel_after_max ca
+                ON m.user_id = ca.user_id
+                AND m.sequence_group_id = ca.sequence_group_id
+                AND ca.rn = 1
+        ),
+        final_per_user AS (
+            -- 각 유저별 최종 선택 (가장 마지막 effective expire date)
+            SELECT
+                user_id,
+                sequence_group_id,
+                effective_expire_date,
+                effective_seq_id,
+                ROW_NUMBER() OVER (
+                    PARTITION BY user_id
+                    ORDER BY effective_expire_date DESC, sequence_group_id DESC
+                ) AS rn
+            FROM effective_per_seq
+        ),
+        last_march_txn AS (
+            SELECT
+                user_id,
+                effective_expire_date AS last_expire_date,
+                sequence_group_id AS last_seq_id,
+                effective_seq_id AS p_tx_id
+            FROM final_per_user
+            WHERE rn = 1
+        ),
+        prev_txn AS (
+            -- 직전 트랜잭션 (같은 sequence_group 내에서 sequence_id - 1)
+            SELECT
+                lmt.user_id,
+                t.sequence_id AS pp_tx_id
+            FROM last_march_txn lmt
+            JOIN {seq_table} t ON lmt.user_id = t.user_id
+                AND lmt.last_seq_id = t.sequence_group_id
+                AND lmt.p_tx_id - 1 = t.sequence_id
+            WHERE lmt.p_tx_id > 0
+        )
+        SELECT
+            lmt.user_id,
+            lmt.last_expire_date,
+            lmt.last_seq_id,
+            lmt.p_tx_id,
+            pt.pp_tx_id
+        FROM last_march_txn lmt
+        LEFT JOIN prev_txn pt ON lmt.user_id = pt.user_id
+    """
+
+    if dry_run:
+        # 통계 확인
+        total_members = con.execute(f"SELECT COUNT(*) FROM {members_table}").fetchone()[0]
+        with_march_txn = con.execute(f"""
+            SELECT COUNT(*) FROM ({mapping_query}) t
+        """).fetchone()[0]
+        with_pp_txn = con.execute(f"""
+            SELECT COUNT(*) FROM ({mapping_query}) t WHERE pp_tx_id IS NOT NULL
+        """).fetchone()[0]
+
+        logger.info(f"전체 멤버: {total_members:,}")
+        logger.info(f"2017년 3월 expire_date 트랜잭션 있음: {with_march_txn:,}")
+        logger.info(f"직전 트랜잭션(pp_tx_id) 있음: {with_pp_txn:,}")
+        logger.info(f"직전 트랜잭션 없음 (p_tx_id=0): {with_march_txn - with_pp_txn:,}")
+
+        if num_samples is not None and num_samples > 0:
+            sample = con.execute(f"""
+                SELECT * FROM ({mapping_query}) t
+                LIMIT {num_samples}
+            """).fetchdf()
+            logger.info(f"샘플 데이터 (상위 {num_samples}개, dry_run):\n{sample.to_string()}")
+
+        con.close()
+        logger.info(f"=== membership_expire_date 2017년 3월 마지막 트랜잭션 정보 추가 완료 (dry_run) ===\n")
+        return
+
+    # 기존 컬럼 삭제 (있으면)
+    cols = [row[0] for row in con.execute(f"DESCRIBE {members_table}").fetchall()]
+    for col in ["last_expire_date", "last_seq_id", "p_tx_id", "pp_tx_id"]:
+        if col in cols:
+            con.execute(f"ALTER TABLE {members_table} DROP COLUMN {col}")
+            logger.info(f"기존 {col} 컬럼 삭제")
+
+    # 새 컬럼 추가
+    con.execute(f"ALTER TABLE {members_table} ADD COLUMN last_expire_date DATE")
+    con.execute(f"ALTER TABLE {members_table} ADD COLUMN last_seq_id BIGINT")
+    con.execute(f"ALTER TABLE {members_table} ADD COLUMN p_tx_id BIGINT")
+    con.execute(f"ALTER TABLE {members_table} ADD COLUMN pp_tx_id BIGINT")
+    logger.info("새 컬럼 추가 완료: last_expire_date, last_seq_id, p_tx_id, pp_tx_id")
+
+    # 데이터 업데이트 (max expire 이후 cancel이 있으면 cancel 기준으로 계산)
+    logger.info("membership_expire_date가 2017년 3월인 마지막 트랜잭션 정보 매핑 중...")
+    con.execute(f"""
+        WITH march_2017_expire_txn AS (
+            -- membership_expire_date가 2017년 3월인 트랜잭션
+            SELECT
+                user_id,
+                transaction_date,
+                membership_expire_date,
+                sequence_group_id,
+                sequence_id,
+                is_cancel
+            FROM {seq_table}
+            WHERE membership_expire_date >= DATE '2017-03-01'
+              AND membership_expire_date <= DATE '2017-03-31'
+        ),
+        max_expire_per_seq AS (
+            -- 각 유저+시퀀스별 3월 내 최대 membership_expire_date
+            SELECT
+                user_id,
+                sequence_group_id,
+                MAX(membership_expire_date) AS max_march_expire
+            FROM march_2017_expire_txn
+            GROUP BY user_id, sequence_group_id
+        ),
+        max_expire_txn AS (
+            -- 최대 expire_date를 가진 트랜잭션 (여러 개면 가장 마지막 것)
+            SELECT
+                t.*,
+                ROW_NUMBER() OVER (
+                    PARTITION BY t.user_id, t.sequence_group_id
+                    ORDER BY t.transaction_date DESC, t.sequence_id DESC
+                ) AS rn
+            FROM march_2017_expire_txn t
+            JOIN max_expire_per_seq m
+                ON t.user_id = m.user_id
+                AND t.sequence_group_id = m.sequence_group_id
+                AND t.membership_expire_date = m.max_march_expire
+        ),
+        max_expire_txn_single AS (
+            SELECT * FROM max_expire_txn WHERE rn = 1
+        ),
+        cancel_after_max AS (
+            -- max expire 트랜잭션 이후의 cancel 트랜잭션 (같은 시퀀스, expire_date도 3월)
+            SELECT
+                c.*,
+                ROW_NUMBER() OVER (
+                    PARTITION BY c.user_id, c.sequence_group_id
+                    ORDER BY c.transaction_date DESC, c.sequence_id DESC
+                ) AS rn
+            FROM march_2017_expire_txn c
+            JOIN max_expire_txn_single m
+                ON c.user_id = m.user_id
+                AND c.sequence_group_id = m.sequence_group_id
+            WHERE c.is_cancel = 1
+              AND (c.transaction_date > m.transaction_date
+                   OR (c.transaction_date = m.transaction_date AND c.sequence_id > m.sequence_id))
+        ),
+        effective_per_seq AS (
+            -- 각 시퀀스의 effective 트랜잭션 결정 (cancel이 있으면 cancel 사용)
+            SELECT
+                m.user_id,
+                m.sequence_group_id,
+                COALESCE(ca.membership_expire_date, m.membership_expire_date) AS effective_expire_date,
+                COALESCE(ca.sequence_id, m.sequence_id) AS effective_seq_id
+            FROM max_expire_txn_single m
+            LEFT JOIN cancel_after_max ca
+                ON m.user_id = ca.user_id
+                AND m.sequence_group_id = ca.sequence_group_id
+                AND ca.rn = 1
+        ),
+        final_per_user AS (
+            -- 각 유저별 최종 선택 (가장 마지막 effective expire date)
+            SELECT
+                user_id,
+                sequence_group_id,
+                effective_expire_date,
+                effective_seq_id,
+                ROW_NUMBER() OVER (
+                    PARTITION BY user_id
+                    ORDER BY effective_expire_date DESC, sequence_group_id DESC
+                ) AS rn
+            FROM effective_per_seq
+        ),
+        last_march_txn AS (
+            SELECT
+                user_id,
+                effective_expire_date AS last_expire_date,
+                sequence_group_id AS last_seq_id,
+                effective_seq_id AS p_tx_id
+            FROM final_per_user
+            WHERE rn = 1
+        ),
+        prev_txn AS (
+            -- 직전 트랜잭션 (같은 sequence_group 내에서 sequence_id - 1)
+            SELECT
+                lmt.user_id,
+                t.sequence_id AS pp_tx_id
+            FROM last_march_txn lmt
+            JOIN {seq_table} t ON lmt.user_id = t.user_id
+                AND lmt.last_seq_id = t.sequence_group_id
+                AND lmt.p_tx_id - 1 = t.sequence_id
+            WHERE lmt.p_tx_id > 0
+        ),
+        final_mapping AS (
+            SELECT
+                lmt.user_id,
+                lmt.last_expire_date,
+                lmt.last_seq_id,
+                lmt.p_tx_id,
+                pt.pp_tx_id
+            FROM last_march_txn lmt
+            LEFT JOIN prev_txn pt ON lmt.user_id = pt.user_id
+        )
+        UPDATE {members_table} m
+        SET
+            last_expire_date = fm.last_expire_date,
+            last_seq_id = fm.last_seq_id,
+            p_tx_id = fm.p_tx_id,
+            pp_tx_id = fm.pp_tx_id
+        FROM final_mapping fm
+        WHERE m.user_id = fm.user_id;
+    """)
+
+    # 결과 통계
+    stats = con.execute(f"""
+        SELECT
+            COUNT(*) AS total,
+            COUNT(last_expire_date) AS with_march_txn,
+            COUNT(pp_tx_id) AS with_pp_txn
+        FROM {members_table}
+    """).fetchone()
+    total, with_march_txn, with_pp_txn = stats
+
+    logger.info(f"전체 멤버: {total:,}")
+    logger.info(f"2017년 3월 expire_date 트랜잭션 매핑됨: {with_march_txn:,}")
+    logger.info(f"직전 트랜잭션(pp_tx_id) 있음: {with_pp_txn:,}")
+    logger.info(f"직전 트랜잭션 없음 (p_tx_id=0): {with_march_txn - with_pp_txn:,}")
+
+    if num_samples is not None and num_samples > 0:
+        sample = con.execute(f"""
+            SELECT user_id, last_expire_date, last_seq_id, p_tx_id, pp_tx_id
+            FROM {members_table}
+            WHERE last_expire_date IS NOT NULL
+            ORDER BY user_id
+            LIMIT {num_samples}
+        """).fetchdf()
+        logger.info(f"샘플 데이터 (상위 {num_samples}개):\n{sample.to_string()}")
+
+    con.close()
+    logger.info(f"=== membership_expire_date 2017년 3월 마지막 트랜잭션 정보 추가 완료 ===\n")
+
+
+# ============================================================================
+# 14.4. members_merge에 is_churn 컬럼 추가 (train_merge에서 복사)
+# ============================================================================
+def add_is_churn_to_members(
+    db_path: str,
+    members_table: str = "members_merge",
+    train_table: str = "train_merge",
+    num_samples: int | None = None,
+    dry_run: bool = False,
+) -> None:
+    """
+    members_merge 테이블에 train_merge의 is_churn 컬럼을 추가합니다.
+
+    Args:
+        db_path: DuckDB 데이터베이스 경로
+        members_table: 멤버 테이블명 (기본값: members_merge)
+        train_table: 학습 데이터 테이블명 (기본값: train_merge)
+        num_samples: 샘플 출력 행 수 (None이면 출력 안 함)
+        dry_run: True면 실제 변경 없이 로그만 출력 (기본값: False)
+
+    추가되는 컬럼:
+        - is_churn: 이탈 여부 (0: 유지, 1: 이탈)
+    """
+    logger.info(f"=== members_merge에 is_churn 컬럼 추가 시작 ===")
+    logger.info(f"대상 테이블: {members_table}")
+    logger.info(f"소스 테이블: {train_table}")
+    if dry_run:
+        logger.info("*** DRY RUN 모드 - 실제 변경 없음 ***")
+
+    con = duckdb.connect(db_path)
+    con.execute("PRAGMA threads=8;")
+
+    # 테이블 존재 확인
+    existing_tables = [row[0] for row in con.execute("SHOW TABLES").fetchall()]
+    if members_table not in existing_tables:
+        logger.error(f"테이블 {members_table}이 존재하지 않습니다.")
+        con.close()
+        return
+    if train_table not in existing_tables:
+        logger.error(f"테이블 {train_table}이 존재하지 않습니다.")
+        con.close()
+        return
+
+    if dry_run:
+        # 통계 확인
+        total_members = con.execute(f"SELECT COUNT(*) FROM {members_table}").fetchone()[0]
+        total_train = con.execute(f"SELECT COUNT(*) FROM {train_table}").fetchone()[0]
+        churn_stats = con.execute(f"""
+            SELECT
+                SUM(CASE WHEN is_churn = 1 THEN 1 ELSE 0 END) AS churn_count,
+                SUM(CASE WHEN is_churn = 0 THEN 1 ELSE 0 END) AS retain_count
+            FROM {train_table}
+        """).fetchone()
+        churn_count, retain_count = churn_stats
+
+        logger.info(f"전체 멤버: {total_members:,}")
+        logger.info(f"train 데이터: {total_train:,}")
+        logger.info(f"  이탈(is_churn=1): {churn_count:,} ({churn_count/total_train*100:.2f}%)")
+        logger.info(f"  유지(is_churn=0): {retain_count:,} ({retain_count/total_train*100:.2f}%)")
+
+        if num_samples is not None and num_samples > 0:
+            sample = con.execute(f"""
+                SELECT m.user_id, t.is_churn
+                FROM {members_table} m
+                JOIN {train_table} t ON m.user_id = t.user_id
+                LIMIT {num_samples}
+            """).fetchdf()
+            logger.info(f"샘플 데이터 (상위 {num_samples}개, dry_run):\n{sample.to_string()}")
+
+        con.close()
+        logger.info(f"=== members_merge에 is_churn 컬럼 추가 완료 (dry_run) ===\n")
+        return
+
+    # 기존 컬럼 삭제 (있으면)
+    cols = [row[0] for row in con.execute(f"DESCRIBE {members_table}").fetchall()]
+    if "is_churn" in cols:
+        con.execute(f"ALTER TABLE {members_table} DROP COLUMN is_churn")
+        logger.info("기존 is_churn 컬럼 삭제")
+
+    # 새 컬럼 추가
+    con.execute(f"ALTER TABLE {members_table} ADD COLUMN is_churn BIGINT")
+    logger.info("새 컬럼 추가 완료: is_churn")
+
+    # 데이터 업데이트
+    logger.info("is_churn 정보 매핑 중...")
+    con.execute(f"""
+        UPDATE {members_table} m
+        SET is_churn = t.is_churn
+        FROM {train_table} t
+        WHERE m.user_id = t.user_id;
+    """)
+
+    # 결과 통계
+    stats = con.execute(f"""
+        SELECT
+            COUNT(*) AS total,
+            COUNT(is_churn) AS with_churn,
+            SUM(CASE WHEN is_churn = 1 THEN 1 ELSE 0 END) AS churn_count,
+            SUM(CASE WHEN is_churn = 0 THEN 1 ELSE 0 END) AS retain_count
+        FROM {members_table}
+    """).fetchone()
+    total, with_churn, churn_count, retain_count = stats
+
+    logger.info(f"전체 멤버: {total:,}")
+    logger.info(f"is_churn 매핑됨: {with_churn:,}")
+    logger.info(f"  이탈(is_churn=1): {churn_count:,} ({churn_count/total*100:.2f}%)")
+    logger.info(f"  유지(is_churn=0): {retain_count:,} ({retain_count/total*100:.2f}%)")
+
+    if num_samples is not None and num_samples > 0:
+        sample = con.execute(f"""
+            SELECT user_id, is_churn
+            FROM {members_table}
+            WHERE is_churn IS NOT NULL
+            ORDER BY user_id
+            LIMIT {num_samples}
+        """).fetchdf()
+        logger.info(f"샘플 데이터 (상위 {num_samples}개):\n{sample.to_string()}")
+
+    con.close()
+    logger.info(f"=== members_merge에 is_churn 컬럼 추가 완료 ===\n")
 
 
 # ============================================================================
@@ -5070,111 +6979,87 @@ if __name__ == "__main__":
     #     ]
     # )
 
-    # # 3. v1/v2 병합 테이블 생성
-    # create_merge_tables(
-    #     db_path=DB_PATH,
-    #     base_names=[
-    #         "raw_train",
-    #         "raw_transactions",
-    #         "raw_user_logs",
-    #         "raw_members",
-    #     ],
-    #     drop_source_tables=False,
-    #     # id_col="user_id",
-    # )
+    # 3. v1/v2 병합 테이블 생성
+    create_merge_tables(
+        db_path=DB_PATH,
+        base_names=[
+            "raw_train",
+            "raw_transactions",
+            "raw_user_logs",
+            "raw_members",
+        ],
+        drop_source_tables=False,
+        # id_col="user_id",
+    )
 
-    # # 4. user_id 매핑 생성 및 변환
-    # create_user_id_mapping(
-    #     db_path=DB_PATH,
-    #     target_tables=[
-    #         "train_v1",
-    #         "train_v2",
-    #         "transactions_v1",
-    #         "transactions_v2",
-    #         "user_logs_v1",
-    #         "user_logs_v2",
-    #         "members_v3",
+    # 4. user_id 매핑 생성 및 변환
+    create_user_id_mapping(
+        db_path=DB_PATH,
+        target_tables=[
+            # "train_v1",
+            # "train_v2",
+            # "transactions_v1",
+            # "transactions_v2",
+            # "user_logs_v1",
+            # "user_logs_v2",
+            # "members_v3",
 
-    #         "train_merge",
-    #         "transactions_merge",
-    #         "user_logs_merge",
-    #         "members_merge",
-    #     ],
-    #     mapping_table_name="user_id_map",
-    # )
+            "train_merge",
+            "transactions_merge",
+            "user_logs_merge",
+            "members_merge",
+        ],
+        mapping_table_name="user_id_map",
+    )
 
-    # # 5. 공통 msno 교집합 필터링 (모든 대상 테이블에 존재하는 msno만 남김)
-    # filter_common_msno(
-    #     db_path=DB_PATH,
-    #     target_tables=[
-    #         "train_merge",
-    #         "transactions_merge",
-    #         "user_logs_merge",
-    #         "members_merge",
-    #     ],
-    #     id_col="user_id",
-    # )
+    # 5. 공통 msno 교집합 필터링 (모든 대상 테이블에 존재하는 msno만 남김)
+    filter_common_msno(
+        db_path=DB_PATH,
+        target_tables=[
+            "train_merge",
+            "transactions_merge",
+            "user_logs_merge",
+            "members_merge",
+        ],
+        id_col="msno",
+    )
 
-    # # 5.5. members_merge 테이블을 기준으로 필터링
-    # filter_by_reference_table(
-    #     db_path=DB_PATH,
-    #     reference_table="members_merge",  # 기준 테이블
-    #     target_tables=[                  # 필터링할 대상 테이블들
-    #         "train_v1",
-    #         "train_v2",
-    #         "transactions_v1",
-    #         "transactions_v2",
-    #         "user_logs_v1",
-    #         "user_logs_v2",
-    #         "members_v3",
-    #     ],
-    # )
+    # 6. gender 필드 정수 변환 (null->-1, male->0, female->1)
+    convert_gender_to_int(db_path=DB_PATH, table_name="members_merge")
 
-    # # 6. gender 필드 정수 변환 (null->-1, male->0, female->1)
-    # convert_gender_to_int(db_path=DB_PATH, table_name="members_v3")
-    # convert_gender_to_int(db_path=DB_PATH, table_name="members_merge")
+    # 7. 날짜 필드 변환
+    convert_date_fields(
+        db_path=DB_PATH,
+        target_tables=[
+            "train_merge",
+            "transactions_merge",
+            "user_logs_merge",
+            "members_merge",
+        ],
+    )
 
-    # # 7. 날짜 필드 변환
-    # convert_date_fields(
-    #     db_path=DB_PATH,
-    #     target_tables=[
-    #         "train_v1",
-    #         "train_v2",
-    #         "transactions_v1",
-    #         "transactions_v2",
-    #         "user_logs_v1",
-    #         "user_logs_v2",
-    #         "members_v3",
+    # 8. msno -> user_id 컬럼명 변경
+    rename_msno_to_user_id(
+        db_path=DB_PATH,
+        target_tables=[
+            "train_v1",
+            "train_v2",
+            "transactions_v1",
+            "transactions_v2",
+            "user_logs_v1",
+            "user_logs_v2",
+            "members_v3",
 
-    #         "train_merge",
-    #         "transactions_merge",
-    #         "user_logs_merge",
-    #         "members_merge",
-    #     ],
-    # )
+            "train_merge",
+            "transactions_merge",
+            "user_logs_merge",
+            "members_merge",
 
-    # # 8. msno -> user_id 컬럼명 변경
-    # rename_msno_to_user_id(
-    #     db_path=DB_PATH,
-    #     target_tables=[
-    #         "train_v1",
-    #         "train_v2",
-    #         "transactions_v1",
-    #         "transactions_v2",
-    #         "user_logs_v1",
-    #         "user_logs_v2",
-    #         "members_v3",
+            # "user_id_map",
+        ]
+    )
 
-    #         "train_merge",
-    #         "transactions_merge",
-    #         "user_logs_merge",
-    #         "members_merge",
-
-    #         # "user_id_map",
-    #     ]
-    # )
-
-    # # 8.1.1. 전이행렬 분석 히트맵 저장
+    # # 9.1.1 전이행렬 분석 히트맵 저장
     # analyze_churn_transition(
     #     db_path=DB_PATH,
     #     train_v1_table="train_v1",
@@ -5183,23 +7068,23 @@ if __name__ == "__main__":
     #     reference_table="members_merge",  # 현재 기준 유저만 분석
     # )
 
-    # # 8.1. Churn 전이 기반 필터링 (v1=0 & v2=0/1인 유저만 남김)
-    # filter_by_churn_transition(
-    #     db_path=DB_PATH,
-    #     train_v1_table="train_v1",
-    #     train_v2_table="train_v2",
-    #     target_tables=[
-    #         "train_merge",
-    #         "transactions_merge",
-    #         "user_logs_merge",
-    #         "members_merge",
-    #         # "user_logs_with_transactions",
-    #     ],
-    #     v1_churn_value=0,           # train_v1에서 is_churn=0인 유저
-    #     v2_churn_values=[0, 1],     # train_v2에서 is_churn이 0 또는 1인 유저
-    # )
+    # 9.1.2. Churn 전이 기반 필터링 (v1=0 & v2=0/1인 유저만 남김)
+    filter_by_churn_transition(
+        db_path=DB_PATH,
+        train_v1_table="train_v1",
+        train_v2_table="train_v2",
+        target_tables=[
+            "train_merge",
+            "transactions_merge",
+            "user_logs_merge",
+            "members_merge",
+            # "user_logs_with_transactions",
+        ],
+        v1_churn_value=0,           # train_v1에서 is_churn=0인 유저
+        v2_churn_values=[0, 1],     # train_v2에서 is_churn이 0 또는 1인 유저
+    )
 
-    # # 8.2.1. 중복 트랜잭션 비율 분석 표 출력 및 결과 저장
+    # # 9.2.1. 중복 트랜잭션 비율 분석 표 출력 및 결과 저장
     # analyze_duplicate_transactions(
     #     db_path=DB_PATH,
     #     transactions_table="transactions_merge",
@@ -5209,63 +7094,69 @@ if __name__ == "__main__":
     #     reference_table="members_merge",  # 현재 기준 유저만 분석
     # )
 
-    # # 8.2. 중복 트랜잭션 유저 제외 (같은 날 비취소 트랜잭션 2개 이상인 유저 제거)
-    # exclude_duplicate_transaction_users(
-    #     db_path=DB_PATH,
-    #     transactions_table="transactions_merge",
-    #     target_tables=[
-    #         "train_merge",
-    #         "transactions_merge",
-    #         "user_logs_merge",
-    #         "members_merge",
-    #         "user_logs_with_transactions",
-    #     ],
-    #     date_col="transaction_date",
-    #     min_txn_count=2,            # 같은 날 2개 이상이면 제외
-    # )
+    # 9.2.2. 중복 트랜잭션 유저 제외 (같은 날 비취소 트랜잭션 2개 이상인 유저 제거)
+    exclude_duplicate_transaction_users(
+        db_path=DB_PATH,
+        transactions_table="transactions_merge",
+        target_tables=[
+            "train_merge",
+            "transactions_merge",
+            "user_logs_merge",
+            "members_merge",
+            # "user_logs_with_transactions",
+        ],
+        date_col="transaction_date",
+        min_txn_count=2,            # 같은 날 2개 이상이면 제외
+        num_samples=5,
+        dry_run=False,
+    )
 
-    # # 8.3. total_secs 범위 밖 값을 NULL로 변환
-    # nullify_out_of_range(
-    #     db_path=DB_PATH,
-    #     table_name="user_logs_merge",
-    #     column_name="total_secs",
-    #     min_val=0,
-    #     max_val=86400,
-    # )
+    # 9.3.1. total_secs 범위 밖 값을 NULL로 변환
+    nullify_out_of_range(
+        db_path=DB_PATH,
+        table_name="user_logs_merge",
+        column_name="total_secs",
+        min_val=0,
+        max_val=86400,
+    )
 
-    # # 8.3.1. NULL total_secs 유저 제외
-    # exclude_null_total_secs_users(
-    #     db_path=DB_PATH,
-    #     logs_table="user_logs_merge",
-    #     target_tables=[
-    #         "train_merge",
-    #         "transactions_merge",
-    #         "user_logs_merge",
-    #         "members_merge",
-    #     ],
-    # )
+    # 9.3.2. NULL total_secs 유저 제외
+    exclude_null_total_secs_users(
+        db_path=DB_PATH,
+        logs_table="user_logs_merge",
+        target_tables=[
+            "train_merge",
+            "transactions_merge",
+            "user_logs_merge",
+            "members_merge",
+        ],
+        num_samples=5,
+        dry_run=False,
+    )
 
-    # # 8.3.2. plan_days가 30, 31인 트랜잭션만 가진 유저 수 분석
+    # # 9.4.1. plan_days가 30, 31인 트랜잭션만 가진 유저 수 분석
     # analyze_plan_days_30_31_users(
     #     db_path=DB_PATH,
     #     transactions_table="transactions_merge",
     # )
 
-    # # 8.3.3. membership_expire_date가 [2015, 2017] 범위 밖인 유저 제외
-    # exclude_out_of_range_expire_date_users(
-    #     db_path=DB_PATH,
-    #     transactions_table="transactions_merge",
-    #     target_tables=[
-    #         "train_merge",
-    #         "transactions_merge",
-    #         "user_logs_merge",
-    #         "members_merge",
-    #     ],
-    #     min_year=2015,
-    #     max_year=2017,
-    # )
+    # 9.5.1. membership_expire_date가 [2015, 2017] 범위 밖인 유저 제외
+    exclude_out_of_range_expire_date_users(
+        db_path=DB_PATH,
+        transactions_table="transactions_merge",
+        target_tables=[
+            "train_merge",
+            "transactions_merge",
+            "user_logs_merge",
+            "members_merge",
+        ],
+        min_year=2015,
+        max_year=2017,
+        num_samples=5,
+        dry_run=False,
+    )
 
-    # # 8.4. analyze
+    # # analyze
     # analyze_feature_correlation(
     #     db_path=DB_PATH,
     #     table_name="user_logs_merge",
@@ -5290,161 +7181,188 @@ if __name__ == "__main__":
     #     },
     # )
 
-    # # 8.5. 트랜잭션 시퀀스 테이블 생성
-    # create_transactions_seq(
-    #     db_path=DB_PATH,
-    #     source_table="transactions_merge",
-    #     target_table="transactions_seq",
-    #     gap_days=30,
-    #     cutoff_date="2017-03-31",
-    # )
+    # 10. 트랜잭션 시퀀스 테이블 생성
+    create_transactions_seq(
+        db_path=DB_PATH,
+        source_table="transactions_merge",
+        target_table="transactions_seq",
+        gap_days=30,
+        cutoff_date="2017-03-31",
+    )
 
-    # # 8.5.1. transactions_seq에 actual_plan_days 추가
-    # add_actual_plan_days(
-    #     db_path=DB_PATH,
-    #     seq_table="transactions_seq",
-    # )
+    # 11.1.1. transactions_seq에 actual_plan_days 추가
+    add_actual_plan_days(
+        db_path=DB_PATH,
+        seq_table="transactions_seq",
+    )
 
-    # # 8.5.2. actual_plan_days 분석 (음수/0/양수 분포 및 추가 통계)
+
+    # # 11.1.2. actual_plan_days 분석 (음수/0/양수 분포 및 추가 통계)
     # analyze_actual_plan_days(
     #     db_path=DB_PATH,
     #     seq_table="transactions_seq",
     #     output_dir="data/analysis",
     # )
 
-    # # 8.5.2.1. is_cancel=1 트랜잭션의 actual_plan_days 분포 분석
+    # # 11.1.3. is_cancel=1 트랜잭션의 actual_plan_days 분포 분석
     # analyze_cancel_actual_plan_days(
     #     db_path=DB_PATH,
     #     seq_table="transactions_seq",
     #     output_dir="data/analysis",
     # )
 
-    # # 8.5.3. actual_plan_days 범위 밖 유저 제외
-    # exclude_out_of_range_actual_plan_days_users(
-    #     db_path=DB_PATH,
-    #     seq_table="transactions_seq",
-    #     target_tables=[
-    #         "train_merge",
-    #         "transactions_merge",
-    #         "user_logs_merge",
-    #         "members_merge",
-    #         "transactions_seq"
-    #     ],
-    #     non_cancel_min=1,
-    #     non_cancel_max=410,
-    #     cancel_min=-410,
-    #     cancel_max=0,
-    # )
+    # 11.1.4. actual_plan_days 범위 밖 유저 제외
+    exclude_out_of_range_actual_plan_days_users(
+        db_path=DB_PATH,
+        seq_table="transactions_seq",
+        target_tables=[
+            "train_merge",
+            "transactions_merge",
+            "user_logs_merge",
+            "members_merge",
+            "transactions_seq"
+        ],
+        non_cancel_min=1,
+        non_cancel_max=410,
+        cancel_min=-410,
+        cancel_max=0,
+        num_samples=5,
+        dry_run=False,
+    )
 
-    # # 8.5.3.1. plan_days_diff 컬럼 추가
-    # add_plan_days_diff(
-    #     db_path=DB_PATH,
-    #     seq_table="transactions_seq",
-    # )
+    # 12.1. plan_days_diff 컬럼 추가
+    add_plan_days_diff(
+        db_path=DB_PATH,
+        seq_table="transactions_seq",
+    )
 
-    # # 8.5.3.2. is_cancel 트랜잭션의 actual_plan_days 분포 분석
+    # # 13.1. is_cancel 트랜잭션의 actual_plan_days 분포 분석
     # analyze_cancel_actual_plan_days_distribution(
     #     db_path=DB_PATH,
     #     seq_table="transactions_seq",
     #     output_dir="data/analysis",
     # )
 
-    # # 8.5.3.3. is_cancel 트랜잭션 중 expire_date < prev_transaction_date 분석
+    # # 13.2.1. is_cancel 트랜잭션 중 expire_date < prev_transaction_date 분석
     # analyze_cancel_expire_before_prev_transaction(
     #     db_path=DB_PATH,
     #     seq_table="transactions_seq",
     #     output_dir="data/analysis",
-    #     show_samples=10,
+    #     num_samples=10,
     # )
 
-    # # 8.5.3.4. is_cancel expire_date < prev_transaction_date 유저 제외
-    # exclude_cancel_expire_before_prev_transaction_users(
-    #     db_path=DB_PATH,
-    #     seq_table="transactions_seq",
-    #     target_tables=[
-    #         "train_merge",
-    #         "transactions_merge",
-    #         "user_logs_merge",
-    #         "members_merge",
-    #         "transactions_seq",
-    #     ],
-    # )
+    # 13.2.2. is_cancel expire_date < prev_transaction_date 유저 제외
+    exclude_cancel_expire_before_prev_transaction_users(
+        db_path=DB_PATH,
+        seq_table="transactions_seq",
+        target_tables=[
+            "train_merge",
+            "transactions_merge",
+            "user_logs_merge",
+            "members_merge",
+            "transactions_seq",
+        ],
+        num_samples=5,
+        dry_run=False,
+    )
 
-    # # 8.5.3.5. is_cancel expire_date < prev_prev_expire_date 분석
+    # # 13.3.1. is_cancel expire_date < prev_prev_expire_date 분석
     # analyze_cancel_expire_before_prev_prev_expire(
     #     db_path=DB_PATH,
     #     seq_table="transactions_seq",
     #     output_dir="data/analysis",
-    #     show_samples=10,
+    #     num_samples=10,
     # )
 
-    # # 8.5.3.6. is_cancel expire_date < prev_prev_expire_date 유저 제외
-    # exclude_cancel_expire_before_prev_prev_expire_users(
-    #     db_path=DB_PATH,
-    #     seq_table="transactions_seq",
-    #     target_tables=[
-    #         "train_merge",
-    #         "transactions_merge",
-    #         "user_logs_merge",
-    #         "members_merge",
-    #         "transactions_seq",
-    #     ],
-    # )
+    # 13.3.2. is_cancel expire_date < prev_prev_expire_date 유저 제외
+    exclude_cancel_expire_before_prev_prev_expire_users(
+        db_path=DB_PATH,
+        seq_table="transactions_seq",
+        target_tables=[
+            "train_merge",
+            "transactions_merge",
+            "user_logs_merge",
+            "members_merge",
+            "transactions_seq",
+        ],
+        num_samples=5,
+        dry_run=False,
+    )
 
-    # # 8.5.3.7. 연속 is_cancel=1 트랜잭션 분석
+    # # 14.1. 연속 is_cancel=1 트랜잭션 분석
     # analyze_consecutive_cancel_transactions(
     #     db_path=DB_PATH,
     #     seq_table="transactions_seq",
     #     output_dir="data/analysis",
-    #     show_samples=3,
+    #     num_samples=3,
     # )
 
-    # # 8.5.3.8. 연속 is_cancel=1 유저 제외
-    # exclude_consecutive_cancel_users(
-    #     db_path=DB_PATH,
-    #     seq_table="transactions_seq",
-    #     target_tables=[
-    #         "train_merge",
-    #         "transactions_merge",
-    #         "user_logs_merge",
-    #         "members_merge",
-    #         "transactions_seq",
-    #     ],
-    # )
+    # 14.2. 연속 is_cancel=1 유저 제외
+    exclude_consecutive_cancel_users(
+        db_path=DB_PATH,
+        seq_table="transactions_seq",
+        target_tables=[
+            "train_merge",
+            "transactions_merge",
+            "user_logs_merge",
+            "members_merge",
+            "transactions_seq",
+        ],
+        num_samples=5,
+        dry_run=False,
+    )
 
-    # # 8.5.4. membership_expire_date 감소 케이스 분석
+    # 14.3. members_merge에 membership_expire_date가 2017년 3월인 마지막 트랜잭션 정보 추가
+    add_march_2017_last_txn_info(
+        db_path=DB_PATH,
+        members_table="members_merge",
+        seq_table="transactions_seq",
+        num_samples=5,
+        dry_run=False,
+    )
+
+    # 14.4. members_merge에 is_churn 컬럼 추가 (train_merge에서 복사)
+    add_is_churn_to_members(
+        db_path=DB_PATH,
+        members_table="members_merge",
+        train_table="train_merge",
+        num_samples=5,
+        dry_run=False,
+    )
+
+    # # 15. membership_expire_date 감소 케이스 분석
     # analyze_expire_date_decrease(
     #     db_path=DB_PATH,
     #     seq_table="transactions_seq",
     # )
 
-    # 8.6. members_merge에 멤버십 시퀀스 정보 추가
-    add_membership_seq_info(
-        db_path=DB_PATH,
-        members_table="members_merge",
-        seq_table="transactions_seq",
-    )
+    # # 16. members_merge에 멤버십 시퀀스 정보 추가
+    # add_membership_seq_info(
+    #     db_path=DB_PATH,
+    #     members_table="members_merge",
+    #     seq_table="transactions_seq",
+    # )
 
-    # # 8.7. members_merge에 멤버십 기간 정보 추가
+    # # 17. members_merge에 멤버십 기간 정보 추가
     # add_membership_duration_info(
     #     db_path=DB_PATH,
     #     members_table="members_merge",
     #     seq_table="transactions_seq",
     # )
 
-    # # 8.8. user_logs_merge에 total_hours 컬럼 추가
-    # add_converted_column(
-    #     db_path=DB_PATH,
-    #     table_name="user_logs_merge",
-    #     source_col="total_secs",
-    #     target_col="total_hours",
-    #     divisor=3600,
-    #     # clip_min=0,
-    #     # clip_max=24,
-    #     force_overwrite=True,
-    # )
+    # 18. user_logs_merge에 total_hours 컬럼 추가
+    add_converted_column(
+        db_path=DB_PATH,
+        table_name="user_logs_merge",
+        source_col="total_secs",
+        target_col="total_hours",
+        divisor=3600,
+        # clip_min=0,
+        # clip_max=24,
+        force_overwrite=True,
+    )
 
-    # # 8.9. Feature 클리핑 구간 분석
+    # # 19. Feature 클리핑 구간 분석
     # analyze_clipping_distribution(
     #     db_path=DB_PATH,
     #     table_name="user_logs_merge",
@@ -5455,7 +7373,7 @@ if __name__ == "__main__":
     #     sample_size=1_000_000,  # 대용량 테이블은 샘플링 권장
     # )
 
-    # # 8.10. 조건부 데이터 변환 (이상치 처리 등)
+    # # 20. 조건부 데이터 변환 (이상치 처리 등)
     # apply_conditional_transform(
     #     db_path=DB_PATH,
     #     table_name="user_logs_merge",
@@ -5479,7 +7397,7 @@ if __name__ == "__main__":
     #     dry_run=False,  # True로 설정하면 실제 변경 없이 영향 행 수만 출력
     # )
 
-    # 9. Parquet 내보내기
+    # 21. Parquet 내보내기
     export_to_parquet(
         db_path=DB_PATH,
         output_dir=PARQUET_DIR,

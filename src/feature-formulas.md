@@ -7,8 +7,16 @@
 ## 기본 정의
 
 ```
-membership_period = membership_expire_date - transaction_date  (마지막 트랜잭션 기준)
-days_before_expire = membership_expire_date - log_date
+# members_merge에서 참조
+last_expire_date = members_merge.last_expire_date  (2017년 3월 기준 마지막 만료일)
+last_seq_id = members_merge.last_seq_id  (마지막 시퀀스 그룹 ID)
+p_tx_id = members_merge.p_tx_id  (마지막 트랜잭션 ID)
+pp_tx_id = members_merge.pp_tx_id  (이전 트랜잭션 ID, NULL 가능)
+
+# 계산 변수
+p_tx = transactions_seq WHERE sequence_id = p_tx_id  (마지막 트랜잭션)
+membership_period = last_expire_date - p_tx.transaction_date
+days_before_expire = last_expire_date - log_date
 gap_days = date - LAG(date)  (연속 로그 날짜 간 간격)
 ```
 
@@ -26,16 +34,18 @@ gap_days = date - LAG(date)  (연속 로그 날짜 간 간격)
 | `num_985_avg` | ∑(num_985) / membership_period |
 | `num_100_avg` | ∑(num_100) / membership_period |
 | `num_unq_avg` | ∑(num_unq) / membership_period |
-| `total_hours_avg` | ∑(total_hours) / membership_period |
+| `total_hours_avg` | ∑(total_secs / 3600) / membership_period |
 
 ### 1.2 접속 텀 (4개)
 
 | Feature | Formula |
 |---------|---------|
-| `log_term_min` | min(gap_days) |
-| `log_term_max` | max(gap_days) |
-| `log_term_avg` | mean(gap_days) |
-| `log_term_median` | median(gap_days) |
+| `log_term_min` | min(gap_days) / 30 |
+| `log_term_max` | max(gap_days) / 30 |
+| `log_term_avg` | mean(gap_days) / 30 |
+| `log_term_median` | median(gap_days) / 30 |
+
+- 모든 접속 텀은 개월(month) 단위로 정규화
 
 ### 1.3 접속 비율 (1개)
 
@@ -101,29 +111,38 @@ gap_days = date - LAG(date)  (연속 로그 날짜 간 간격)
 
 | Feature | Formula |
 |---------|---------|
-| `plan_days` | 마지막 트랜잭션의 payment_plan_days |
-| `last_is_cancel` | 마지막 트랜잭션의 is_cancel (0 또는 1) |
-| `payment_method_id` | 마지막 트랜잭션의 결제 수단 ID |
-| `membership_duration` | seq_end_date - seq_start_date (현재 시퀀스) |
-| `tx_seq_length` | COUNT(*) per current sequence_group |
-| `cancel_exist` | max(is_cancel) per current sequence_group |
-| `had_churn` | 1 if sequence_group_id > 0 else 0 |
+| `payment_plan_months` | 가장 최근 non-cancel 트랜잭션의 payment_plan_days / 30 |
+| `last_is_cancel` | p_tx의 is_cancel (0 또는 1) |
+| `payment_method_id` | p_tx의 payment_method_id |
+| `membership_months` | (last_seq의 seq_end_date - seq_start_date) / 30 |
+| `tx_seq_length` | COUNT(*) where sequence_group_id = last_seq_id |
+| `cancel_exist` | MAX(is_cancel) where sequence_group_id = last_seq_id |
+| `had_churn` | 1 if last_seq_id > 0 else 0 |
 
 ### 상세 설명
 
+- **p_tx**: members_merge.p_tx_id로 참조되는 트랜잭션 (2017년 3월 만료 기준 마지막 트랜잭션)
+- **last_seq**: members_merge.last_seq_id로 참조되는 시퀀스 그룹
 - **sequence_group**: 연속된 멤버십 기간을 하나의 그룹으로 묶은 것
-- **had_churn**: sequence_group_id > 0이면 이전에 이탈 후 재가입한 경험이 있음
+- **had_churn**: last_seq_id > 0이면 이전에 이탈 후 재가입한 경험이 있음
+- **payment_plan_months**: p_tx가 cancel인 경우 pp_tx의 payment_plan_days / 30 사용
+- 모든 기간 피처는 개월(month) 단위로 정규화
 
 ---
 
-## 3. Members Features (1개)
+## 3. Members Features (2개)
 
 | Feature | Formula |
 |---------|---------|
-| `registration_init` | max(registration_init_time, '2015-01-01') - '2015-01-01' |
+| `registration_dur` | (last_expire_date - registration_init_time) / 30 |
+| `actual_plan_months` | p_tx가 non-cancel → (p_tx.membership_expire_date - p_tx.transaction_date) / 30<br>p_tx가 cancel → (p_tx.membership_expire_date - pp_tx.transaction_date) / 30 |
 
-- 가입일을 2015-01-01 기준으로 클리핑 후 일수로 변환
-- 2015-01-01 이전 가입자는 모두 0으로 처리
+### 상세 설명
+
+- **registration_dur**: last_expire_date로부터 registration_init_time까지의 개월 수 (일수/30)
+- **actual_plan_months**: 실제 멤버십 기간 (개월 단위)
+  - p_tx가 non-cancel인 경우: (membership_expire_date - transaction_date) / 30
+  - p_tx가 cancel인 경우: (p_tx.membership_expire_date - pp_tx.transaction_date) / 30
 
 ---
 
@@ -184,6 +203,6 @@ create_user_logs_features(fill_nan=False, default_value=0)
 | User Logs - 표준편차 | 1 | log_std |
 | User Logs - 주별 청취 | 4 | week_1, week_2, week_3, week_4 |
 | User Logs - 청취 비율 | 2 | num_25_ratio, num_100_ratio |
-| Transactions | 7 | plan_days, last_is_cancel, payment_method_id, membership_duration, tx_seq_length, cancel_exist, had_churn |
-| Members | 1 | registration_init |
+| Transactions | 7 | payment_plan_months, last_is_cancel, payment_method_id, membership_months, tx_seq_length, cancel_exist, had_churn |
+| Members | 2 | registration_dur, actual_plan_months |
 | **총계** | **30** | (타겟 is_churn 제외) |
